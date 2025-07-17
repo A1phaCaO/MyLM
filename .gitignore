@@ -1,0 +1,8 @@
+train_text/
+logs/
+model/
+ckpt/
+.vscode/
+.mypy_cache/
+__pycache__/
+*.txt
