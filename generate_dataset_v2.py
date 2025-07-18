@@ -78,8 +78,9 @@ for INPUT_PATH in PATH_LIST:
                     batch_out_list.append(segment_text)
                     start_idx = end_idx
 
-        # 将当前batch的结果写入文件
-        output_data.write("\n".join(batch_out_list) + "\n")
+            # 将当前batch的结果写入文件
+            output_data.write("\n".join(batch_out_list) + "\n")
+            batch_out_list.clear()  # 清空当前batch的结果，以便下一个文件的处理结果不会与当前文件的结果混淆
 
 # 关闭文件（实际上with语句已经自动关闭）
 data.close()
