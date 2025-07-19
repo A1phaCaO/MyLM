@@ -9,23 +9,27 @@ tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
 # 将输入路径按逗号分割成列表
 # PATH_LIST = [input('输入文件地址：').strip("'").strip('"')]
 PATH_LIST = [
-    r"train_text\distill_r1_55k_sft2pretrain_processed.txt",
-    r"train_text\WanJuan1.0part-000036-a894b46e-downsample10x-processed.txt",
-    r"train_text\SkyPile2023-14_zh_head_0000_processed.jsonl",
+    # r"train_text\distill_r1_110k_sft2pretrain_processed.txt",
+    # r"train_text\WanJuan1.0part-000036-a894b46e-downsample10x-processed.txt",
+    # r"train_text\SkyPile2023-14_zh_head_0000_processed.jsonl",
+    r"train_text\distill_r1_110k_sft_processed.txt",
+    r"train_text\Beautiful-Chinese-processed.txt",
+    r"train_text\Infinity-Instruct-Gen-00000-of-00015-processed.txt"
+
 ]
 
 # 设定句子的最大长度和数据集下采样率
-SENTENCE_MAXLEN = 192
-DATASET_DOWNSAMPLE = 1
+SENTENCE_MAXLEN = 384
+DATASET_DOWNSAMPLE= [1, 50, 1]
 BATCH_SIZE = 384  # 设置合适的批量大小
 # 定义分隔符和是否从符号位置开始切分句子的标志
 SPLIT_SYMBOL = ("。", "，", "？", "；", "！")
 SPLIT_FROM_SYMBOL = False
-OUTPUT_PATH = r"data_250716_large.txt"
+OUTPUT_PATH = r"data_sft.txt"
 
 
 # 打开输入文件和创建输出文件
-for INPUT_PATH in PATH_LIST:
+for i, INPUT_PATH in enumerate(PATH_LIST):
     # 每个文件单独处理
     with open(INPUT_PATH, "r", encoding="UTF-8") as data, open(
         OUTPUT_PATH, "a", encoding="UTF-8"
@@ -39,7 +43,7 @@ for INPUT_PATH in PATH_LIST:
 
         # 批量处理数据
 
-        data_lines = list(data)[::DATASET_DOWNSAMPLE]
+        data_lines = list(data)[::DATASET_DOWNSAMPLE[i]]
 
         for i in tqdm(range(0, len(data_lines), BATCH_SIZE)):
             batch = data_lines[i : i + BATCH_SIZE]
