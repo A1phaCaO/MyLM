@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import json
-import models_250715 as m
+import models_250718 as m
 from utils import TextGenerator, model_structure
 from tokenizers import Tokenizer  # 引入 tokenizers 库
 import tokenizers
@@ -10,9 +10,9 @@ import tokenizers
 
 
 # 导入模型文件
-model_dir = r"model\model_6k0517-0715-23M-1G_instruct2.pth"
-tokenizer_dir = r"bpe_tokenizer_6k_0517.json"
-config_dir = r"model\config_0715.json"
+model_dir = r"model\model_6k0717-0718-16M-1_5G_insturct.pth"
+tokenizer_dir = r"bpe_tokenizer_6k_0717.json"
+config_dir = r"model\config_0718.json"
 
 with open(config_dir, 'r', encoding='utf-8') as f:
     config = json.load(f)
@@ -82,7 +82,7 @@ while True:
         print(f'T={T}')
     else:
         if INSTURCT_MODE:
-            start = "user: " + start + " gpt: "
+            start = "user: " + start + "[END]gpt: "
         print(f'temperature={T}\n' +
             "".join(
                 test_generator.generate(
@@ -91,8 +91,8 @@ while True:
                     temperature=T,
                     top_k=20,
                     # top_p=0.7,
-                    frequency_penalty=0.5,
+                    frequency_penalty=1,
                     print_out=False
                 )
-            ).split('"')[0]
+            )
         )

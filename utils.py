@@ -30,9 +30,9 @@ class TextGenerator:
     self,
     start_token: str,
     gen_seq_len=30,
-    temperature=1,
-    frequency_penalty=0.0,
-    top_k=None,
+    temperature=0.7,
+    frequency_penalty=0.1,
+    top_k=20,
     print_out=True,
     ):
         with torch.no_grad():
@@ -78,7 +78,7 @@ class TextGenerator:
                 next_token_id = probabilities.multinomial(num_samples=1).item()
                 
                 # 更新序列
-                tokens.append(self.tokenizer.decode([next_token_id]))
+                tokens.append(self.tokenizer.decode([next_token_id], skip_special_tokens=False))
                 if print_out:
                     print(tokens[-1], end=" ", flush=True)
             

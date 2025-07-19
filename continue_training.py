@@ -22,7 +22,7 @@ from typing import Optional, Dict, Any
 # ---------------------------------------------------#
 from utils import model_structure, TextGenerator, WarmUpCosineLR, DebugTimer
 from dataset import TextDatasetV4
-import models_250715 as models
+import models_250718 as models
 from pre_train import PreTrainer
 
 
@@ -34,32 +34,32 @@ class TrainingConfig:
     """训练配置参数"""
 
     # 数据配置
-    data_dir: str = r"sft_data.txt"
-    tokenizer_dir: str = r"bpe_tokenizer_6k_0517.json"
-    model_save_dir: str = r"model\model_6k0517-0715-23M-1G_instruct.pth"
+    data_dir: str = r"data_sft.txt"
+    tokenizer_dir: str = r"bpe_tokenizer_6k_0717.json"
+    model_save_dir: str = r"model\model_6k0717-0718-16M-1_5G_insturct.pth"
     ckpt_save_dir: str = r"ckpt\ckpt.pth"
     log_dir: str = r"logs"
     padding_side = "left"
 
     # 训练参数
     seed: int = 42
-    epochs: int = 2
+    epochs: int = 1
     batch_size: int = 32
     batch_acceleration: int = 12
     dataset_downsample: int = 10
-    valset_rate: float = 0.01
-    val_interval_step: int = 400
+    valset_rate: float = 0.02
+    val_interval_step: int = 120
 
     # 优化参数
-    learning_rate: float = 1e-4
-    min_learning_rate: float = 1e-5
+    learning_rate: float = 8e-5
+    min_learning_rate: float = 8e-6
     warmup_steps: int = 3
     use_amp: bool = False
 
     # 模型参数
     d_model: int = 384
     d_inner: int = int(((384 * (8 / 3)) // 64) * 64)
-    n_layers: int = 3
+    n_layers: int = 2
     use_moe: bool = False
     n_experts: int = 3
     vocab_size: int = None  # 运行时获取
@@ -67,7 +67,7 @@ class TrainingConfig:
 
     # 新增参数：checkpoint保存间隔步数
     ckpt_interval_step: int = float("inf")
-    train_from: Optional[str] = r"model\model_6k0517-0715-23M-1G.pth"
+    train_from: Optional[str] = r"model\model_6k0717-0718-16M-1_5G.pth"
 
 
 class ContinueTrainer(PreTrainer):
