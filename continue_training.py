@@ -36,7 +36,7 @@ class TrainingConfig:
     # 数据配置
     data_dir: str = r"data_sft.txt"
     tokenizer_dir: str = r"bpe_tokenizer_6k_0717.json"
-    model_save_dir: str = r"model\model_6k0717-0718-16M-1_5G_insturct.pth"
+    model_save_dir: str = r"model\model_6k0717-0718-16M-1_5G_insturct_large.pth"
     ckpt_save_dir: str = r"ckpt\ckpt.pth"
     log_dir: str = r"logs"
     padding_side = "left"
@@ -46,12 +46,12 @@ class TrainingConfig:
     epochs: int = 1
     batch_size: int = 32
     batch_acceleration: int = 12
-    dataset_downsample: int = 10
-    valset_rate: float = 0.02
+    dataset_downsample: int = 5
+    valset_rate: float = 0.01
     val_interval_step: int = 120
 
     # 优化参数
-    learning_rate: float = 8e-5
+    learning_rate: float = 6e-5
     min_learning_rate: float = 8e-6
     warmup_steps: int = 3
     use_amp: bool = False

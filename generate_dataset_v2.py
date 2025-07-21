@@ -1,5 +1,6 @@
 from tqdm import tqdm
 from tokenizers import Tokenizer
+import codecs
 
 # 加载tokenizer
 TOKENIZER_PATH = r"bpe_tokenizer_6k_0717.json"
@@ -9,33 +10,40 @@ tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
 # 将输入路径按逗号分割成列表
 # PATH_LIST = [input('输入文件地址：').strip("'").strip('"')]
 PATH_LIST = [
-    # r"train_text\distill_r1_110k_sft2pretrain_processed.txt",
-    # r"train_text\WanJuan1.0part-000036-a894b46e-downsample10x-processed.txt",
-    # r"train_text\SkyPile2023-14_zh_head_0000_processed.jsonl",
-    r"train_text\distill_r1_110k_sft_processed.txt",
-    r"train_text\Beautiful-Chinese-processed.txt",
-    r"train_text\Infinity-Instruct-Gen-00000-of-00015-processed.txt"
+    r"train_text\distill_r1_110k_sft2pretrain_processed.txt",
+    r"train_text\WanJuan1.0part-000036-a894b46e-downsample10x-processed.txt",
+    r"train_text\SkyPile2023-14_zh_head_0000_processed.jsonl",
+    r"train_text\Infinity-Instruct-Gen-00000-of-00015-sft2pretrain-processed.txt"
+    # r"train_text\distill_r1_110k_sft_processed.txt",
+    # r"train_text\Beautiful-Chinese-processed.txt",
+    # r"train_text\Infinity-Instruct-Gen-00000-of-00015-processed.txt"
 
 ]
 
 # 设定句子的最大长度和数据集下采样率
-SENTENCE_MAXLEN = 384
-DATASET_DOWNSAMPLE= [1, 50, 1]
+SENTENCE_MAXLEN = 192
+DATASET_DOWNSAMPLE= [1, 1, 1, 1]
 BATCH_SIZE = 384  # 设置合适的批量大小
 # 定义分隔符和是否从符号位置开始切分句子的标志
 SPLIT_SYMBOL = ("。", "，", "？", "；", "！")
 SPLIT_FROM_SYMBOL = False
-OUTPUT_PATH = r"data_sft.txt"
+OUTPUT_PATH = r"data_k.txt"
 
 
 # 打开输入文件和创建输出文件
 for i, INPUT_PATH in enumerate(PATH_LIST):
     # 每个文件单独处理
-    with open(INPUT_PATH, "r", encoding="UTF-8") as data, open(
+    with open(INPUT_PATH, "r", encoding="UTF-8", errors='ignore') as data, open(
         OUTPUT_PATH, "a", encoding="UTF-8"
     ) as output_data:
         # 获取数据长度并重置文件读取位置
-        data_len = len(list(data))
+        try:
+            data_len = len(list(data))
+        except:
+            # 如果第一次读取失败，尝试用latin-1重新打开文件
+            data.close()
+            data = codecs.open(INPUT_PATH, "r", encoding="latin-1", errors='ignore')
+            data_len = len(list(data))
         data.seek(0)
 
         # 初始化存储输入输出数据的列表
@@ -43,7 +51,13 @@ for i, INPUT_PATH in enumerate(PATH_LIST):
 
         # 批量处理数据
 
-        data_lines = list(data)[::DATASET_DOWNSAMPLE[i]]
+        # 尝试用UTF-8读取，如果失败则用latin-1读取
+        try:
+            data_lines = list(data)[::DATASET_DOWNSAMPLE[i]]
+        except:
+            data.close()
+            data = codecs.open(INPUT_PATH, "r", encoding="latin-1", errors='ignore')
+            data_lines = list(data)[::DATASET_DOWNSAMPLE[i]]
 
         for i in tqdm(range(0, len(data_lines), BATCH_SIZE)):
             batch = data_lines[i : i + BATCH_SIZE]
