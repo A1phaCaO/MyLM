@@ -43,16 +43,16 @@ class TrainingConfig:
 
     # 训练参数
     seed: int = 42
-    epochs: int = 3
-    batch_size: int = 32
-    batch_acceleration: int = 16
-    dataset_downsample: int = 3
+    epochs: int = 2
+    batch_size: int = 64
+    batch_acceleration: int = 4
+    dataset_downsample: int = 2
     valset_rate: float = 0.01
-    val_interval_step: int = 1000
+    val_interval_step: int = 50
 
     # 优化参数
-    learning_rate: float = 9e-4
-    min_learning_rate: float = 6e-5
+    learning_rate: float = 5e-3
+    min_learning_rate: float = 5e-4
     warmup_steps: int = 1
     use_amp: bool = False
 
@@ -98,7 +98,7 @@ class PreTrainer:
         self.train_loss_log = []  # 将改为存储(step, loss)格式
         self.val_loss_log = []
         self.lr_log = []
-        
+
         # 如果指定了resume_from路径，加载checkpoint
         if config.resume_from is not None:
             self.load_checkpoint(config.resume_from)
@@ -166,7 +166,12 @@ class PreTrainer:
     def _build_optimizer(self):
         """构建优化器和学习率调度器"""
         optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=self.config.learning_rate, amsgrad=True
+            self.model.parameters(),
+            lr=self.config.learning_rate,
+            amsgrad=False,
+            betas=(0.85, 0.999),
+            eps=1e-6,
+            weight_decay=0.005,
         )
 
         scheduler = WarmUpCosineLR(
@@ -251,7 +256,7 @@ class PreTrainer:
 
         self.scaler.scale(loss).backward()
         # 梯度裁剪（可选）
-        
+
         if ((self.current_step + 1) % self.config.batch_acceleration == 0) or (
             self.current_step + 1 == len(self.train_loader)
         ):
@@ -265,23 +270,21 @@ class PreTrainer:
         return loss.item() * self.config.batch_acceleration
 
     def log(self):
-            total_params = model_structure(self.model)
-            print(f"本次训练参数：")
-            print(f"词数: {self.tokenizer.get_vocab_size()}")
-            val_dataset_len, train_dataset_len = len(self.val_loader.dataset), len(
-                self.train_loader.dataset
-            )
-            print(f"数据集数量：{val_dataset_len+train_dataset_len}")
-            print(f"训练集数量：{train_dataset_len}")
-            print(f"测试集数量：{val_dataset_len}")
-            nums_token = self.config.seq_max_len * train_dataset_len
-            print(f"Token数约：{nums_token/1e6:.3f}M")
-            print(f"模型参数：{total_params/1e6:.3f}M")
-            print(
-                f"计算量：{(nums_token * total_params * 6)/1e12:.2f}TFLOPs * {self.config.epochs} = {(nums_token * total_params * 6 * self.config.epochs)/1e12:.2f}TFLOPs"
-            )
-            
-
+        total_params = model_structure(self.model)
+        print(f"本次训练参数：")
+        print(f"词数: {self.tokenizer.get_vocab_size()}")
+        val_dataset_len, train_dataset_len = len(self.val_loader.dataset), len(
+            self.train_loader.dataset
+        )
+        print(f"数据集数量：{val_dataset_len+train_dataset_len}")
+        print(f"训练集数量：{train_dataset_len}")
+        print(f"测试集数量：{val_dataset_len}")
+        nums_token = self.config.seq_max_len * train_dataset_len
+        print(f"Token数约：{nums_token/1e6:.3f}M")
+        print(f"模型参数：{total_params/1e6:.3f}M")
+        print(
+            f"计算量：{(nums_token * total_params * 6)/1e12:.2f}TFLOPs * {self.config.epochs} = {(nums_token * total_params * 6 * self.config.epochs)/1e12:.2f}TFLOPs"
+        )
 
     def train(self):
         """训练主循环"""

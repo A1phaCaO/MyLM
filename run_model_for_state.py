@@ -10,7 +10,7 @@ import tokenizers
 
 
 # 导入模型文件
-model_dir = r"model\model_6k0717-0718-16M-1_5G_insturct.pth"
+model_dir = r"model\model_6k0717-0718-16M-1_5G.pth"
 tokenizer_dir = r"bpe_tokenizer_6k_0717.json"
 config_dir = r"model\config_0718.json"
 
