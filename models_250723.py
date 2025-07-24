@@ -524,7 +524,6 @@ if __name__ == "__main__":
         d_model=512,
         d_inner=2048,
         n_layers=8,
-        n_heads=512//64,
         vocab_size=10000,
         seq_max_len=512,
         use_moe=False,
