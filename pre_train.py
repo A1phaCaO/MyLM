@@ -22,8 +22,7 @@ from typing import Optional, Dict, Any
 # ---------------------------------------------------#
 from utils import model_structure, TextGenerator, WarmUpCosineLR, DebugTimer
 from dataset import TextDatasetV4
-import models
-
+from models import MyLMArgs, MyLM
 
 t = DebugTimer()
 
@@ -44,9 +43,9 @@ class TrainingConfig:
     # 训练参数
     seed: int = 42
     epochs: int = 2
-    batch_size: int = 64
+    batch_size: int = 32
     batch_acceleration: int = 4
-    dataset_downsample: int = 2
+    dataset_downsample: int = 6
     valset_rate: float = 0.01
     val_interval_step: int = 50
 
@@ -56,14 +55,23 @@ class TrainingConfig:
     warmup_steps: int = 1
     use_amp: bool = False
 
-    # 模型参数
-    d_model: int = 128
-    d_inner: int = int(((128 * (8 / 3)) // 64) * 64)
-    n_layers: int = 2
-    use_moe: bool = False
-    n_experts: int = 3
-    vocab_size: int = None  # 运行时获取
-    seq_max_len: int = None  # 运行时获取
+    model_args = MyLMArgs(
+        d_model=432,
+        d_inner=int(((432 * (8 / 3)) // 64) * 64),
+        d_head=72,
+        n_heads=6,
+        n_layers=2,
+        vocab_size=None,
+        seq_max_len=None,
+        use_moe=False,
+        n_experts=None,
+        n_experts_per_tok=None,
+        d_conv = None,
+        conv_bias = None,
+        ffn_bias = False,
+        attn_bias = True,
+        dropout = 0.1
+    )
 
     # 新增参数：checkpoint保存间隔步数
     ckpt_interval_step: int = 1000
@@ -78,7 +86,7 @@ class PreTrainer:
         self._set_seed()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer = tokenizers.Tokenizer.from_file(config.tokenizer_dir)
-        self.config.vocab_size = len(self.tokenizer.get_vocab())
+        self.config.model_args.vocab_size = len(self.tokenizer.get_vocab())
         self.train_loader, self.val_loader = self._build_dataloader()
         self.model = self._build_model().to(self.device)
         self.criterion = nn.CrossEntropyLoss()
@@ -115,20 +123,7 @@ class PreTrainer:
 
     def _build_model(self):
         """构建模型"""
-        args = models.MyLMArgs(
-            d_model=self.config.d_model,
-            d_inner=self.config.d_inner,
-            n_layers=self.config.n_layers,
-            use_moe=self.config.use_moe,
-            n_experts=self.config.n_experts,
-            vocab_size=self.config.vocab_size,
-            seq_max_len=self.config.seq_max_len,
-            conv_bias=False,
-            ffn_bias=False,
-            attn_bias=False,
-            dropout=0.1,
-        )
-        model = models.MyLM(args)
+        model = MyLM(self.config.model_args)
         return model
 
     def _build_dataloader(self):
@@ -141,7 +136,7 @@ class PreTrainer:
             batch=False,
             padding_side=self.config.padding_side,
         )
-        self.config.seq_max_len = dataset.seq_max_len
+        self.config.model_args.seq_max_len = dataset.seq_max_len
         val_dataset_len = int(len(dataset) * self.config.valset_rate)
         train_dataset_len = len(dataset) - val_dataset_len
         train_dataset, val_dataset = torch.utils.data.random_split(
@@ -249,7 +244,7 @@ class PreTrainer:
         with torch.autocast(str(self.device), enabled=self.config.use_amp):
             output = self.model(inputs)
             loss = self.criterion(
-                output.view(-1, self.config.vocab_size), targets.view(-1)
+                output.view(-1, self.config.model_args.vocab_size), targets.view(-1)
             )
 
         loss = loss / self.config.batch_acceleration
@@ -279,7 +274,7 @@ class PreTrainer:
         print(f"数据集数量：{val_dataset_len+train_dataset_len}")
         print(f"训练集数量：{train_dataset_len}")
         print(f"测试集数量：{val_dataset_len}")
-        nums_token = self.config.seq_max_len * train_dataset_len
+        nums_token = self.config.model_args.seq_max_len * train_dataset_len
         print(f"Token数约：{nums_token/1e6:.3f}M")
         print(f"模型参数：{total_params/1e6:.3f}M")
         print(
@@ -400,7 +395,7 @@ class PreTrainer:
                 with torch.autocast(str(self.device), enabled=self.config.use_amp):
                     val_output = self.model(val_inputs)
                     loss = self.criterion(
-                        val_output.view(-1, self.config.vocab_size),
+                        val_output.view(-1, self.config.model_args.vocab_size),
                         val_targets.view(-1),
                     )
                 val_loss_sum += loss.item()
@@ -456,7 +451,7 @@ class PreTrainer:
 
 if __name__ == "__main__":
     config = TrainingConfig()
-    config_dict = asdict(config)
+    config_dict = asdict(config.model_args)
     with open(config.config_save_dir, "w") as f:
         json.dump(config_dict, f, indent=4)
     trainer = PreTrainer(config)
