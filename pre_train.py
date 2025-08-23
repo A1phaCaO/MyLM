@@ -21,7 +21,7 @@ from typing import Optional, Dict, Any
 #   工具组件
 # ---------------------------------------------------#
 from utils import model_structure, TextGenerator, WarmUpCosineLR, DebugTimer
-from dataset import TextDatasetV4
+from dataset import TextDatasetV4, RuntimeTextDatasetV4
 from models import MyLMArgs, MyLM
 
 t = DebugTimer()
@@ -32,8 +32,8 @@ class TrainingConfig:
     """训练配置参数"""
 
     # 数据配置
-    data_dir: str = r"data_test.txt"
-    tokenizer_dir: str = r"bpe_tokenizer_6k_0517.json"
+    data_dir: str = r"data_large_ChatML.txt"
+    tokenizer_dir: str = r"bpe_tokenizer_6k_0724_ChatML.json"
     model_save_dir: str = r"model\model_state.pth"
     ckpt_save_dir: str = r"ckpt\ckpt.pth"
     config_save_dir: str = r"config.json"
@@ -45,9 +45,10 @@ class TrainingConfig:
     epochs: int = 2
     batch_size: int = 32
     batch_acceleration: int = 4
-    dataset_downsample: int = 6
-    valset_rate: float = 0.01
-    val_interval_step: int = 50
+    dataset_downsample: int = 1
+    valset_rate: float = 0.001
+    val_interval_step: int = 1000
+    seq_max_len=192
 
     # 优化参数
     learning_rate: float = 5e-3
@@ -56,13 +57,13 @@ class TrainingConfig:
     use_amp: bool = False
 
     model_args = MyLMArgs(
-        d_model=432,
-        d_inner=int(((432 * (8 / 3)) // 64) * 64),
-        d_head=72,
-        n_heads=6,
-        n_layers=2,
+        d_model=128,
+        d_inner=int(((128 * (4 / 3)) // 64) * 64),
+        d_head=64,
+        n_heads=None,
+        n_layers=1,
         vocab_size=None,
-        seq_max_len=None,
+        seq_max_len=seq_max_len,
         use_moe=False,
         n_experts=None,
         n_experts_per_tok=None,
@@ -89,7 +90,7 @@ class PreTrainer:
         self.config.model_args.vocab_size = len(self.tokenizer.get_vocab())
         self.train_loader, self.val_loader = self._build_dataloader()
         self.model = self._build_model().to(self.device)
-        self.criterion = nn.CrossEntropyLoss()
+        self.criterion = nn.CrossEntropyLoss(ignore_index=0)
         self.optimizer, self.scheduler = self._build_optimizer()
         self.scaler = torch.GradScaler(self.device, enabled=config.use_amp)
         self.generator = TextGenerator(
@@ -128,15 +129,15 @@ class PreTrainer:
 
     def _build_dataloader(self):
         """构建数据加载器"""
-        dataset = TextDatasetV4(
+        dataset = RuntimeTextDatasetV4(
             self.config.data_dir,
             downsample=self.config.dataset_downsample,
+            seq_max_len=self.config.seq_max_len,
             tokenizer=self.tokenizer,
             re_tokenize=False,
             batch=False,
             padding_side=self.config.padding_side,
         )
-        self.config.model_args.seq_max_len = dataset.seq_max_len
         val_dataset_len = int(len(dataset) * self.config.valset_rate)
         train_dataset_len = len(dataset) - val_dataset_len
         train_dataset, val_dataset = torch.utils.data.random_split(
@@ -148,12 +149,14 @@ class PreTrainer:
             batch_size=self.config.batch_size,
             shuffle=True,
             pin_memory=False,
+            num_workers=2
         )
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
             pin_memory=False,
+            num_workers=2
         )
 
         return train_loader, val_loader
@@ -271,6 +274,7 @@ class PreTrainer:
         val_dataset_len, train_dataset_len = len(self.val_loader.dataset), len(
             self.train_loader.dataset
         )
+        print(f"上下文长度：{self.config.model_args.seq_max_len}")
         print(f"数据集数量：{val_dataset_len+train_dataset_len}")
         print(f"训练集数量：{train_dataset_len}")
         print(f"测试集数量：{val_dataset_len}")
@@ -335,6 +339,8 @@ class PreTrainer:
                 # 验证阶段
                 if i % self.config.val_interval_step == 0:
                     val_loss = self.validate()
+                    # 文本生成测试
+                    self.generate_test("人工智能是")
                     self.val_loss_log.append((self.global_step, val_loss))
                     # 添加TensorBoard验证损失记录
                     writer.add_scalar("Loss/val", val_loss, self.global_step)
@@ -343,9 +349,7 @@ class PreTrainer:
                 bar.update(1)
                 bar.postfix = f"train_loss: {loss:.2f} test_loss: {val_loss:.2f} lr: {self.scheduler.get_last_lr()[0]:.2e}"
 
-                if i % 5000 == 4999:
-                    # 文本生成测试
-                    self.generate_test("人工智能是")
+                   
 
                 # 每n步直接保存checkpoint
                 if self.global_step % self.config.ckpt_interval_step == 0:
