@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import json
-import models_250718 as m
+import models_250728 as m
 from utils import TextGenerator, model_structure
 from tokenizers import Tokenizer  # 引入 tokenizers 库
 import tokenizers
@@ -10,9 +10,9 @@ import tokenizers
 
 
 # 导入模型文件
-model_dir = r"model\model_6k0717-0718-16M-1_5G.pth"
-tokenizer_dir = r"bpe_tokenizer_6k_0717.json"
-config_dir = r"model\config_0718.json"
+model_dir = r"model\model_6k0717-0728-18M-1_7G_ChatML.pth"
+tokenizer_dir = r"bpe_tokenizer_6k_0724_ChatML.json"
+config_dir = r"model\config_0728.json"
 
 with open(config_dir, 'r', encoding='utf-8') as f:
     config = json.load(f)
@@ -38,14 +38,16 @@ args = m.MyLMArgs(
             n_layers=config['n_layers'],
             use_moe=config['use_moe'],
             n_experts=config['n_experts'],
+            n_heads=config['n_heads'],
+            d_head=config['d_head'],
             vocab_size=tokenizer.get_vocab_size(),
             seq_max_len=512,
             conv_bias=False,
             ffn_bias=False,
-            attn_bias=False,
+            attn_bias=True,
             dropout=0,
         )
-
+print(config)
 model = m.MyLM(args).to('cuda')
 model_structure(model)
 state_dict = torch.load(model_dir)
@@ -67,9 +69,9 @@ except Exception as e:
         print(f'未匹配参数：{unexpect}')
 
 test_generator = TextGenerator(model, tokenizer, 'cuda', padding_side="left")
-MAX_LEN = 128
+MAX_LEN = 256
 T=0.6
-INSTURCT_MODE = True
+INSTURCT_MODE = False
 
 while True:
     if INSTURCT_MODE:
@@ -82,7 +84,7 @@ while True:
         print(f'T={T}')
     else:
         if INSTURCT_MODE:
-            start = "user: " + start + "[END]gpt: "
+            start = f"<|im_start|>user\n{start}<|im_end|>\n<|im_start|>assistant\n"
         print(f'temperature={T}\n' +
             "".join(
                 test_generator.generate(
@@ -91,7 +93,7 @@ while True:
                     temperature=T,
                     top_k=20,
                     # top_p=0.7,
-                    frequency_penalty=1,
+                    frequency_penalty=0.5,
                     print_out=False
                 )
             )

@@ -184,6 +184,11 @@ class Attention(nn.Module):
         """
         super().__init__()
         self.embed_dim = embed_dim
+        if head_dim is None:
+            head_dim = 64
+        if num_heads is None:
+            num_heads = embed_dim // head_dim
+        
         self.num_heads = num_heads
         self.head_dim = head_dim
         assert self.head_dim * num_heads == embed_dim, "embed_dim必须能被num_heads整除"
@@ -265,7 +270,7 @@ class Attention(nn.Module):
         # v = self.v_proj(x)
         q = self.q_pos(x)
         k = self.k_pos(x)
-        v = F.tanh(x) * self.v_emb(token_ids).permute(1, 0, 2)
+        v = F.silu(x) * self.v_emb(token_ids).permute(1, 0, 2)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
