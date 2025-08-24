@@ -21,7 +21,7 @@ from typing import Optional, Dict, Any
 #   工具组件
 # ---------------------------------------------------#
 from utils import model_structure, TextGenerator, WarmUpCosineLR, DebugTimer
-from dataset import TextDatasetV4, RuntimeTextDatasetV4
+from dataset import TextDatasetV4, RuntimeTextDatasetV4, StreamingTextDataset
 from models import MyLMArgs, MyLM
 
 t = DebugTimer()
@@ -44,7 +44,7 @@ class TrainingConfig:
     seed: int = 42
     epochs: int = 2
     batch_size: int = 32
-    batch_acceleration: int = 4
+    batch_acceleration: int = 6
     dataset_downsample: int = 1
     valset_rate: float = 0.001
     val_interval_step: int = 1000
@@ -58,7 +58,7 @@ class TrainingConfig:
 
     model_args = MyLMArgs(
         d_model=128,
-        d_inner=int(((128 * (4 / 3)) // 64) * 64),
+        d_inner=int(((128 * (3 / 3)) // 64) * 64),
         d_head=64,
         n_heads=None,
         n_layers=1,
@@ -149,14 +149,14 @@ class PreTrainer:
             batch_size=self.config.batch_size,
             shuffle=True,
             pin_memory=False,
-            num_workers=2
+            num_workers=1
         )
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
             pin_memory=False,
-            num_workers=2
+            num_workers=0
         )
 
         return train_loader, val_loader

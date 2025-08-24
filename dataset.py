@@ -4,8 +4,125 @@ from utils import DebugTimer
 from tqdm import tqdm
 import tokenizers
 import json
+import sys
 
 # import tracemalloc
+
+
+class StreamingTextDataset(torch.utils.data.Dataset):
+    """
+    流式文本数据集，避免将整个数据集加载到内存中
+    只存储文件路径和行位置信息，在需要时才读取特定行
+    """
+    def __init__(
+        self,
+        data_dir: str,
+        tokenizer: tokenizers.Tokenizer,
+        seq_max_len: int = 192,
+        downsample: int = 1,
+        batch: bool = None, # 兼容性参数
+        re_tokenize: bool = False,
+        padding_side: str = "right",
+    ):
+        super().__init__()
+        self.data_dir = data_dir
+        self.tokenizer = tokenizer
+        self.seq_max_len = seq_max_len
+        self.re_tokenize = re_tokenize
+        self.padding_side = padding_side
+        
+        # 构建行索引，只存储行的偏移位置而不是内容
+        self.line_offsets = []
+        self._build_line_index(downsample)
+        
+    def _build_line_index(self, downsample: int):
+        """构建行偏移索引，避免加载整个文件"""
+        with open(self.data_dir, 'rb') as f:
+            offset = 0
+            line_count = 0
+            while True:
+                if line_count % downsample == 0:
+                    self.line_offsets.append(offset)
+                
+                line = f.readline()
+                if not line:
+                    break
+                    
+                offset += len(line)
+                line_count += 1
+    
+    def pad_seq(
+        self,
+        seq: list[int],
+        max_len: int,
+        truncation=True,
+        padding_value=0,
+        padding_side="left",
+    ):
+        """
+        对序列进行填充
+        Args:
+            seq: 序列
+            max_len: 最大长度
+            padding_value: 填充值
+            padding_side: 填充方向
+        Returns:
+            填充后的序列
+        """
+        # 截断
+        if truncation:
+            if padding_side == "right":
+                seq = seq[:max_len]
+            elif padding_side == "left":
+                seq = seq[-max_len:]
+            else:
+                raise ValueError("padding_side must be 'left' or 'right'")
+
+        # 填充
+        if len(seq) < max_len:
+            if padding_side == "left":
+                seq = [padding_value] * (max_len - len(seq)) + seq
+            elif padding_side == "right":
+                seq = seq + [padding_value] * (max_len - len(seq))
+            else:
+                raise ValueError("padding_side must be 'left' or 'right'")
+
+        return seq
+
+    def __len__(self):
+        return len(self.line_offsets)
+
+    def __getitem__(self, index):
+        """
+        根据索引获取数据样本，只在需要时读取特定行
+        """
+        # 根据索引定位并读取特定行
+        with open(self.data_dir, 'r', encoding='utf-8') as f:
+            f.seek(self.line_offsets[index])
+            line = f.readline().strip()
+        
+        # 进行tokenization
+        if self.re_tokenize:
+            # 如果需要重新分词，直接使用原始字符串
+            raw = self.tokenizer.encode(line).ids
+        else:
+            # 如果使用预分词数据，需要先将字符串分割成列表
+            raw = self.tokenizer.encode(
+                line.split(" "), is_pretokenized=True
+            ).ids
+            
+        raw = self.pad_seq(
+            raw,
+            max_len=self.seq_max_len,
+            truncation=True,
+            padding_value=0,
+            padding_side=self.padding_side,
+        )
+
+        # 将列表转换为tensor
+        raw_tensor = torch.tensor(raw, dtype=torch.long)
+
+        return (raw_tensor[:-1].contiguous(), raw_tensor[1:].contiguous())
 
 
 class RuntimeTextDatasetV4(torch.utils.data.Dataset):
@@ -39,7 +156,8 @@ class RuntimeTextDatasetV4(torch.utils.data.Dataset):
             data_dir, downsample
         )  # 加载并预处理数据目录中的数据
         self.re_tokenize = re_tokenize
-
+        print(sys.getsizeof(self.raw_data))
+        
     def pad_seq(
         self,
         seq: list[int],
@@ -136,7 +254,7 @@ class RuntimeTextDatasetV4(torch.utils.data.Dataset):
             max_len=self.seq_max_len,
             truncation=True,
             padding_value=0,
-            padding_side="left",
+            padding_side=self.padding_side,
         )
 
         # 将列表转换为tensor
@@ -415,13 +533,25 @@ class Vocab:
 
 
 if __name__ == "__main__":
-    dataset = RuntimeTextDatasetV4(
+    import time
+    dataset = StreamingTextDataset(
         r"data_large_ChatML.txt",
-        downsample=1,
+        downsample=10,
         tokenizer=tokenizers.Tokenizer.from_file(r"bpe_tokenizer_6k_0724_ChatML.json"),
         re_tokenize=False,
-        batch=True,
+        # batch=True,
         seq_max_len=192,
         padding_side="left",
     )
-    print(dataset[0])
+    train_loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=32,
+            shuffle=True,
+            pin_memory=False,
+            num_workers=0
+        )
+    t1 = time.perf_counter()
+    for i, (inputs, targets) in enumerate(train_loader):
+        if i % 100==0:
+            print((time.perf_counter() - t1)*10, 'ms')
+            t1 = time.perf_counter()
