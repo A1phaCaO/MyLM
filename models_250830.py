@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,6 +10,7 @@ import math
 class MyLMArgs:
     d_model: int
     d_inner: int
+    n_heads: int
     n_layers: int
     vocab_size: int
     seq_max_len: int
@@ -21,6 +21,7 @@ class MyLMArgs:
     conv_bias: bool = True
     ffn_bias: bool = False
     attn_bias: bool = False
+    d_head: int = 64
     dropout: float = 0.1
 
 
@@ -37,6 +38,57 @@ class RMSNorm(torch.nn.Module):
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * x.to(input_dtype)
 
+
+class CausalConv1d(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        dilation=1,
+        groups=1,
+        bias=True,
+    ):
+        super(CausalConv1d, self).__init__()
+        self.pad = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=self.pad,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+
+    def forward(self, input):
+        return self.conv(input)[:, :, : -self.pad]
+
+
+class GPT2PositionEmbedding(nn.Module):
+    def __init__(self, seq_max_len, d_model):
+        super().__init__()
+        self.pos_emb = nn.Embedding(seq_max_len, d_model // 8)
+        self.up_proj = nn.Linear(d_model // 8, d_model, bias=False)
+
+    def _reset_parameters(self):
+        nn.init.normal_(self.pos_emb.weight, std=0.01)
+        nn.init.normal_(self.up_proj.weight, std=0.01)
+
+    def forward(self, x):
+        batch_size, seq_len, d_model = x.shape
+
+        assert (
+            seq_len <= self.pos_emb.num_embeddings
+        ), f"序列长度 {seq_len} 超过预设最大值 {self.pos_emb.num_embeddings}"  # 检查序列长度是否超限
+        # 生成位置编码并相加
+        pos = torch.arange(seq_len).to(x.device)  # (seq_len,)
+        pos_emb = self.pos_emb(pos)  # (seq_len, d_model)
+        pos_emb = self.up_proj(pos_emb)
+        pos_emb = pos_emb.unsqueeze(0)  # (1, seq_len, d_model)
+        return x + pos_emb  # 广播到 (batch_size, seq_len, d_model)
 
 
 class MyPositionEmbedding(nn.Module):
@@ -73,7 +125,7 @@ class TokenShift(nn.Module):
         # 定义填充层：在时间维度上向后滑动一位（如[0,0,1,-1]表示在第三维前补1，后删1）
         self.pad = nn.ZeroPad2d((0, 0, 1, -1))  # 适用于输入形状为 (B, T, C)
         self.mix_k = nn.Parameter(torch.zeros(hidden_dim))
-        nn.init.normal_(self.mix_k, mean=0, std=0.02)
+        nn.init.normal_(self.mix_k, mean=0, std=0.01)
 
     def forward(self, x):
         xx = self.pad(x) - x  # x_t + xx = x_t-1
@@ -122,7 +174,7 @@ class ALiBi(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0, bias=True):
+    def __init__(self, embed_dim, head_dim, num_heads, vocab_size=None, dropout=0, bias=True):
         """
         Args:
             embed_dim: 模型的总维度
@@ -132,8 +184,13 @@ class Attention(nn.Module):
         """
         super().__init__()
         self.embed_dim = embed_dim
+        if head_dim is None:
+            head_dim = 64
+        if num_heads is None:
+            num_heads = embed_dim // head_dim
+        
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.head_dim = head_dim
         assert self.head_dim * num_heads == embed_dim, "embed_dim必须能被num_heads整除"
 
         # 线性变换矩阵
@@ -148,10 +205,13 @@ class Attention(nn.Module):
         self.q_pos = MyPositionEmbedding(embed_dim, embed_dim)
         self.k_pos = MyPositionEmbedding(embed_dim, embed_dim)
 
+        if vocab_size is not None:
+            # self.k_emb = nn.Embedding(vocab_size, embed_dim)
+            self.v_emb = nn.Embedding(vocab_size, embed_dim)
+
         self.q_norm = nn.LayerNorm(embed_dim)
         self.k_norm = nn.LayerNorm(embed_dim)
 
-        # self.sigmoid_alpha = nn.Parameter(torch.tensor(0, dtype=torch.float32))
 
         self.dropout = dropout
         self.bias = bias
@@ -160,10 +220,13 @@ class Attention(nn.Module):
 
     def _reset_parameters(self):
         # Xavier/Kaiming初始化对于注意力权重效果较好
-        # torch.nn.init.kaiming_normal_(self.q_proj.weight)
-        # torch.nn.init.kaiming_normal_(self.k_proj.weight)
-        # torch.nn.init.kaiming_normal_(self.v_proj.weight)
+        # torch.nn.init.xavier_uniform_(self.q_proj.weight)
+        # torch.nn.init.xavier_uniform_(self.k_proj.weight)
+        # torch.nn.init.xavier_uniform_(self.v_proj.weight)
         torch.nn.init.kaiming_normal_(self.out_proj.weight)
+        # 判断是否存在v_emb
+        if hasattr(self, "v_emb"):
+            torch.nn.init.ones_(self.v_emb.weight)
 
         # 如果有偏置项，初始化为小的常数
         if self.bias is True:
@@ -175,6 +238,7 @@ class Attention(nn.Module):
     def forward(
         self,
         x,
+        token_ids=None,
         attn_bias=None,
         batch_first=True,
         need_weights=False,
@@ -206,7 +270,7 @@ class Attention(nn.Module):
         # v = self.v_proj(x)
         q = self.q_pos(x)
         k = self.k_pos(x)
-        v = x
+        v = F.silu(x) * self.v_emb(token_ids).permute(1, 0, 2)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -245,29 +309,31 @@ class Attention(nn.Module):
                 torch.nn.Transformer.generate_square_subsequent_mask(seq_len).to(
                     x.device
                 )
-                if attn_bias is None
-                else attn_bias
+                if attn_mask is None
+                else attn_mask
             )
         else:
             mask = attn_mask
-        
+
         mask = mask.to(torch.bool)
-        attn_weights = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        attn_weights = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim) # QK/sqrt(d_k)
+
+        # 应用掩码
         if attn_bias is not None:
             attn_weights += attn_bias
-            # print(attn_bias)
+
         if mask is not None:
             attn_weights += attn_weights.masked_fill(mask, float("-inf"))
-        attn_weights = F.softmax(
-            attn_weights, dim=-1
-        )
-        attn_output = attn_weights @ v
+
+
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_output = attn_weights @ v  # 加权求和
+
 
         # 恢复形状 [B, T, H*D]
         attn_output = (
             attn_output.transpose(0, 1).contiguous().view(seq_len, bsz, embed_dim)
         )
-
         # 最终输出投影
         attn_output = self.out_proj(attn_output)
 
@@ -298,17 +364,18 @@ class FFN(nn.Module):
         nn.init.ones_(self.deep_emb.weight)
 
     def telu(self, x):
-        return F.tanh(torch.exp(x))*x
+        return F.tanh(torch.exp(x)) * x
+
     def forward(self, x, token_ids=None):
 
         # FFN Block
         # SwiGLU
         # x = self.up_proj(x) * F.silu(self.gate_proj(x))
-        # x = x * self.deep_emb(token_ids)
         x = self.up_proj(x) * self.telu(self.gate_proj(x))
         x = self.down_proj(x)
         x = self.dropout(x)
-        return x * self.deep_emb(token_ids)
+        x = x * self.deep_emb(token_ids)
+        return x
 
 
 class MoEFFN(nn.Module):
@@ -359,7 +426,7 @@ class MoEFFN(nn.Module):
         return expert_outputs
 
 
-class MyLMBlock(nn.Module):
+class MyLMDecoderLayer(nn.Module):
 
     def __init__(self, args: MyLMArgs):
         super().__init__()
@@ -367,15 +434,20 @@ class MyLMBlock(nn.Module):
         self.dropout = nn.Dropout(args.dropout)
         # self.alibi = ALiBi(args.d_model // 64)
         self.mha: Attention = Attention(
-            args.d_model, args.d_model // 64, args.dropout, bias=args.attn_bias
+            args.d_model,
+            args.d_head,
+            args.n_heads,
+            dropout=args.dropout,
+            bias=args.attn_bias,
+            vocab_size=args.vocab_size,
         )
+        
         self.ffn = MoEFFN(args) if args.use_moe else FFN(args)
 
-        self.attn_norm = RMSNorm(args.d_model)
-        self.ffn_norm = RMSNorm(args.d_model)
+        self.pre_attn_norm = RMSNorm(args.d_model)
+        self.pre_ffn_norm = RMSNorm(args.d_model)
         self.ffn_alpha = torch.nn.Parameter(torch.tensor(1, dtype=torch.float32))
         self.attn_alpha = torch.nn.Parameter(torch.tensor(1, dtype=torch.float32))
-        # self.res_alpha = torch.nn.Parameter(torch.tensor(1, dtype=torch.float32))
         self._reset_parameters()
 
     def _reset_parameters(self): ...
@@ -387,20 +459,19 @@ class MyLMBlock(nn.Module):
 
         # Attention Block
         res = x
-        x = self.attn_norm(x)
+        x = self.pre_attn_norm(x)
 
         x = self.mha(
             x,
+            token_ids=token_ids,
             # attn_bias=alibi_bias,
             is_causal=True,
             batch_first=True,
         )
         x = x + res * self.attn_alpha
-        # x = res * self.res_alpha + x
-
         # FFN Block
         res = x
-        x = self.ffn_norm(x)
+        x = self.pre_ffn_norm(x)
         if token_ids is not None:
             x = self.ffn(x, token_ids)
         else:
@@ -421,12 +492,10 @@ class MyLM(nn.Module):
         self.emb = nn.Embedding(args.vocab_size, args.d_model)
         # self.pos = GPT2PositionEmbedding(args.seq_max_len, args.d_model)
         # self.pos = MyPositionEmbedding(args.d_model)
-        self.blocks = nn.ModuleList([MyLMBlock(args) for _ in range(args.n_layers)])
+        self.blocks = nn.ModuleList([MyLMDecoderLayer(args) for _ in range(args.n_layers)])
         self.norm_f = RMSNorm(args.d_model)
 
         self.lm_head = nn.Linear(args.d_model, args.vocab_size, bias=False)
-        # self.lm_head_lora_in = nn.Linear(args.d_model, 128, bias=False)
-        # self.lm_head_lora_out = nn.Linear(128, args.vocab_size, bias=False)
         self._reset_parameters()
         self.lm_head.weight = self.emb.weight
 
@@ -434,14 +503,12 @@ class MyLM(nn.Module):
         # 初始化
         # nn.init.kaiming_normal_(self.emb.weight, mode="fan_in", nonlinearity="relu")
         nn.init.normal_(self.emb.weight, mean=0, std=0.02)
-        # nn.init.kaiming_normal_(self.lm_head_lora_out.weight, mode='fan_in', nonlinearity='relu')
-        # nn.init.kaiming_normal_(self.lm_head_lora_in.weight, mode='fan_in', nonlinearity='relu')
 
     def forward(self, x):
         token_ids = x
         x = self.emb(x)
         # x = self.pos(x)
-        
+
         assert not torch.isnan(x).any(), f"emb nan"
         # 每经过一层block也进行检查
         for i, layer in enumerate(self.blocks):
@@ -451,10 +518,8 @@ class MyLM(nn.Module):
         x = self.norm_f(x)
         x = self.lm_head(x)
 
-        # lora lm head
-        # x = self.lm_head_lora_in(x)
-        # x = self.lm_head_lora_out(x)
         return x
+
 
 if __name__ == "__main__":
     # 测试
@@ -464,10 +529,11 @@ if __name__ == "__main__":
         d_model=512,
         d_inner=2048,
         n_layers=8,
+        n_heads=512//64,
         vocab_size=10000,
         seq_max_len=512,
         use_moe=False,
-        dropout=0.1
+        dropout=0.1,
     )
 
     # 实例化模型
@@ -480,8 +546,12 @@ if __name__ == "__main__":
 
     # 前向传播
     outputs = model(input_ids)
-    
+
     # 检查输出形状
-    assert outputs.shape == (batch_size, seq_length, args.vocab_size), f"Output shape错误: {outputs.shape}"
+    assert outputs.shape == (
+        batch_size,
+        seq_length,
+        args.vocab_size,
+    ), f"Output shape错误: {outputs.shape}"
     print("测试通过!")
     print(f"输出形状: {outputs.shape}")

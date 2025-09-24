@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import json
-import models_250728 as m
+import models_250830 as m
 from utils import TextGenerator, model_structure
 from tokenizers import Tokenizer  # 引入 tokenizers 库
 import tokenizers
@@ -10,9 +10,9 @@ import tokenizers
 
 
 # 导入模型文件
-model_dir = r"model\model_6k0717-0728-18M-1_7G_ChatML.pth"
+model_dir = r"model\model_sft.pth"
 tokenizer_dir = r"bpe_tokenizer_6k_0724_ChatML.json"
-config_dir = r"model\config_0728.json"
+config_dir = r"model\config_0830.json"
 
 with open(config_dir, 'r', encoding='utf-8') as f:
     config = json.load(f)
@@ -41,7 +41,7 @@ args = m.MyLMArgs(
             n_heads=config['n_heads'],
             d_head=config['d_head'],
             vocab_size=tokenizer.get_vocab_size(),
-            seq_max_len=512,
+            seq_max_len=192,
             conv_bias=False,
             ffn_bias=False,
             attn_bias=True,
@@ -71,7 +71,7 @@ except Exception as e:
 test_generator = TextGenerator(model, tokenizer, 'cuda', padding_side="left")
 MAX_LEN = 256
 T=0.6
-INSTURCT_MODE = False
+INSTURCT_MODE = True
 
 while True:
     if INSTURCT_MODE:

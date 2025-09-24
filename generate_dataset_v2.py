@@ -10,28 +10,28 @@ tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
 # 将输入路径按逗号分割成列表
 # PATH_LIST = [input('输入文件地址：').strip("'").strip('"')]
 PATH_LIST = [
-    r"train_text\WanJuan1.0part-000036-a894b46e-downsample10x-processed.txt",
-    r"train_text\Infinity-Instruct-Gen-00000-of-00015-sft2pretrain-processed.txt",
-    r"train_text\distill_r1_110k_sft2pretrain_processed.txt",
-    r"train_text\SkyPile2023-14_zh_head_0000_processed.txt",
-    r"train_text\SkyPile2022-40_zh_middle_0011_processed.txt",
-    r"train_text\SkyPile2023-14_zh_middle_0010_processed.txt",
+    # r"train_text\WanJuan1.0part-000036-a894b46e-downsample10x-processed.txt",
+    # r"train_text\Infinity-Instruct-Gen-00000-of-00015-sft2pretrain-processed.txt",
+    # r"train_text\distill_r1_110k_sft2pretrain_processed.txt",
+    # r"train_text\SkyPile2023-14_zh_head_0000_processed.txt",
+    # r"train_text\SkyPile2022-40_zh_middle_0011_processed.txt",
+    # r"train_text\SkyPile2023-14_zh_middle_0010_processed.txt",
     # ---pretrain---
-    # r"train_text\SFT\distill_r1_110k_sft_processed.txt",
+    r"train_text\SFT\distill_r1_110k_sft_processed.txt",
     # r"train_text\Beautiful-Chinese-processed.txt",
-    # r"train_text\SFT\Infinity-Instruct-Gen-00000-of-00015-processed.txt"
+    r"train_text\SFT\Infinity-Instruct-Gen-00000-of-00015-processed.txt"
 
 ]
 
 # 设定句子的最大长度和数据集下采样率
 SENTENCE_MAXLEN = 192+1
-DATASET_DOWNSAMPLE= [7, 2, 2, 7, 3, 2]
-# DATASET_DOWNSAMPLE = [1, 1]
+# DATASET_DOWNSAMPLE= [7, 2, 2, 7, 3, 2]
+DATASET_DOWNSAMPLE = [1, 1]
 BATCH_SIZE = 512  # 设置合适的批量大小
 # 定义分隔符和是否从符号位置开始切分句子的标志
 SPLIT_SYMBOL = ("。", "，", "？", "；", "！")
-SPLIT_FROM_SYMBOL = False
-OUTPUT_PATH = r"data_test_ChatML.txt"
+SPLIT_FROM_SYMBOL = True
+OUTPUT_PATH = r"data_sft.txt"
 
 
 # 打开输入文件和创建输出文件
