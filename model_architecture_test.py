@@ -64,7 +64,7 @@ class ModelTestConfig:
     model_class: Type = MyLM
 
     # 新增：备注信息
-    notes: str = "w/ remake+init" 
+    notes: str = "Large" 
 
 
 class ModelArchitectureTester:
