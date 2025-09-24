@@ -42,11 +42,11 @@ class TrainingConfig:
 
     # 训练参数
     seed: int = 42
-    epochs: int = 2
+    epochs: int = 4
     batch_size: int = 32
-    batch_acceleration: int = 6
-    dataset_downsample: int = 1
-    valset_rate: float = 0.001
+    batch_acceleration: int = 4
+    dataset_downsample: int = 0.001
+    valset_rate: float = 0.01
     val_interval_step: int = 1000
     seq_max_len=192
 
@@ -57,8 +57,8 @@ class TrainingConfig:
     use_amp: bool = False
 
     model_args = MyLMArgs(
-        d_model=128,
-        d_inner=int(((128 * (3 / 3)) // 64) * 64),
+        d_model=192,
+        d_inner=int(((192 * (8 / 3)) // 64) * 64),
         d_head=64,
         n_heads=None,
         n_layers=1,
@@ -129,7 +129,7 @@ class PreTrainer:
 
     def _build_dataloader(self):
         """构建数据加载器"""
-        dataset = RuntimeTextDatasetV4(
+        dataset = StreamingTextDataset(
             self.config.data_dir,
             downsample=self.config.dataset_downsample,
             seq_max_len=self.config.seq_max_len,
@@ -149,14 +149,14 @@ class PreTrainer:
             batch_size=self.config.batch_size,
             shuffle=True,
             pin_memory=False,
-            num_workers=1
+            num_workers=4
         )
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
             pin_memory=False,
-            num_workers=0
+            num_workers=1
         )
 
         return train_loader, val_loader

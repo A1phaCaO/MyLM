@@ -1,6 +1,6 @@
 {
-    "d_model": 128,
-    "d_inner": 128,
+    "d_model": 192,
+    "d_inner": 512,
     "n_heads": null,
     "n_layers": 1,
     "vocab_size": null,
