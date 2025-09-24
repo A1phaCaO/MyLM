@@ -196,14 +196,14 @@ class Attention(nn.Module):
 
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
-        self._reset_parameters
+        self._reset_parameters()
 
     def _reset_parameters(self):
         """初始化参数"""
-        nn.init.normal_(self.q_proj.weight, std=0.02)
-        nn.init.normal_(self.k_proj.weight, std=0.02)
-        nn.init.normal_(self.v_proj.weight, std=0.02)
-        nn.init.normal_(self.o_proj.weight, std=0.02)
+        nn.init.normal_(self.q_proj.weight, std=1/(4*(self.d_model**0.5)))
+        nn.init.normal_(self.k_proj.weight, std=1/(4*(self.d_model**0.5)))
+        nn.init.normal_(self.v_proj.weight, std=1/(4*(self.d_model**0.5)))
+        nn.init.normal_(self.o_proj.weight, std=1/(4*(self.d_model**0.5)))
 
 
     def _init_rope(self):
@@ -291,6 +291,7 @@ class FFN(nn.Module):
 
     def __init__(self, args: MyLMArgs):
         super().__init__()
+        self.args = args
         self.gate_proj = nn.Linear(args.d_model, args.d_inner, bias=False)
         self.up_proj = nn.Linear(args.d_model, args.d_inner, bias=False)
         self.down_proj = nn.Linear(args.d_inner, args.d_model, bias=False)
@@ -298,9 +299,9 @@ class FFN(nn.Module):
         self._reset_parameters()
 
     def _reset_parameters(self):
-        torch.nn.init.kaiming_normal_(self.gate_proj.weight, nonlinearity="relu")
-        torch.nn.init.kaiming_normal_(self.up_proj.weight, nonlinearity="relu")
-        torch.nn.init.kaiming_normal_(self.down_proj.weight, nonlinearity="relu")
+        torch.nn.init.normal_(self.gate_proj.weight, std=1/((self.args.d_model**0.5)))
+        torch.nn.init.normal_(self.up_proj.weight, std=1/((self.args.d_model**0.5)))
+        torch.nn.init.normal_(self.down_proj.weight, std=1/((self.args.d_inner**0.5)))
 
     def forward(self, x: torch.Tensor, token_ids=None) -> torch.Tensor:
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))

@@ -476,7 +476,11 @@ if __name__ == '__main__':
         # r'logs\MyLM(w- llama+normal_init)_20250923_213313.json',
         # r'logs\MyLM(w- align llama+normal_init)_20250923_215837.json',
         # r'logs\MyLM(w- remake+init)_20250923_233911.json',
-        r'logs\MyLM(w- remake+init)_20250924_125536.json'
+        # r'logs\MyLM(w- remake+init)_20250924_125536.json',
+        # r'logs\MyLM(new init)_20250924_134254.json',
+        # r'logs\MyLM(Att normal + FFN He)_20250924_154224.json'
+        r'logs\LLaMABaseline(Large)_20250924_160746.json',
+        r'logs\MyLM(Large)_20250924_161301.json'
         
     ]
     
