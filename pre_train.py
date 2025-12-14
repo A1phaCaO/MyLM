@@ -1,9 +1,15 @@
+import os
+
+# 设置环境变量以解决OpenMP库重复初始化问题
+os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
+
 import torch
 import torch.nn as nn
 import torch.utils.data
 import torch.nn.functional as F
 import torch
-import bitsandbytes as bnb
+
+# import bitsandbytes as bnb
 import numpy as np
 import matplotlib.pyplot as plt
 import tokenizers
@@ -32,7 +38,7 @@ class TrainingConfig:
     """训练配置参数"""
 
     # 数据配置
-    data_dir: str = r"data_large_ChatML.txt"
+    data_dir: str = r"nano_test_data180.txt"
     tokenizer_dir: str = r"bpe_tokenizer_6k_0724_ChatML.json"
     model_save_dir: str = r"model\model_state.pth"
     ckpt_save_dir: str = r"ckpt\ckpt.pth"
@@ -42,36 +48,36 @@ class TrainingConfig:
 
     # 训练参数
     seed: int = 42
-    epochs: int = 4
-    batch_size: int = 32
-    batch_acceleration: int = 4
-    dataset_downsample: int = 0.001
+    epochs: int = 3
+    batch_size: int = 16
+    batch_acceleration: int = 8
+    dataset_downsample: int = 0.3
     valset_rate: float = 0.01
     val_interval_step: int = 1000
-    seq_max_len=192
+    seq_max_len = 180
 
     # 优化参数
-    learning_rate: float = 5e-3
-    min_learning_rate: float = 5e-4
+    learning_rate: float = 3.5e-3
+    min_learning_rate: float = 3.5e-4
     warmup_steps: int = 1
     use_amp: bool = False
 
     model_args = MyLMArgs(
-        d_model=192,
-        d_inner=int(((192 * (8 / 3)) // 64) * 64),
-        d_head=64,
+        d_model=512,
+        d_inner=int(((512 * (6 / 3)) // 64) * 64),
+        d_head=128,
         n_heads=None,
-        n_layers=1,
+        n_layers=3,
         vocab_size=None,
         seq_max_len=seq_max_len,
         use_moe=False,
         n_experts=None,
         n_experts_per_tok=None,
-        d_conv = None,
-        conv_bias = None,
-        ffn_bias = False,
-        attn_bias = True,
-        dropout = 0.1
+        d_conv=None,
+        conv_bias=None,
+        ffn_bias=False,
+        attn_bias=True,
+        dropout=0.1,
     )
 
     # 新增参数：checkpoint保存间隔步数
@@ -91,7 +97,7 @@ class PreTrainer:
         self.train_loader, self.val_loader = self._build_dataloader()
         self.model = self._build_model().to(self.device)
         self.criterion = nn.CrossEntropyLoss(ignore_index=0)
-        self.optimizer, self.scheduler = self._build_optimizer()
+        self.optimizers, self.schedulers = self._build_optimizer()
         self.scaler = torch.GradScaler(self.device, enabled=config.use_amp)
         self.generator = TextGenerator(
             self.model, self.tokenizer, self.device, padding_side=config.padding_side
@@ -149,40 +155,92 @@ class PreTrainer:
             batch_size=self.config.batch_size,
             shuffle=True,
             pin_memory=False,
-            num_workers=4
+            num_workers=4,
         )
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
             pin_memory=False,
-            num_workers=1
+            num_workers=1,
         )
 
         return train_loader, val_loader
 
     def _build_optimizer(self):
-        """构建优化器和学习率调度器"""
-        optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.config.learning_rate,
-            amsgrad=False,
-            betas=(0.85, 0.999),
-            eps=1e-6,
-            weight_decay=0.005,
-        )
+        """构建优化器"""
+        muon_params = []
+        other_params = []
 
-        scheduler = WarmUpCosineLR(
-            optimizer,
-            total_epochs=(
-                self.config.epochs
-                * (len(self.train_loader) // self.config.batch_acceleration + 1)
-            )
-            + 1,
-            warmup_epochs=self.config.warmup_steps,
-            min_lr=self.config.min_learning_rate,
-        )
-        return optimizer, scheduler
+        # 遍历所有命名参数
+        for name, param in self.model.named_parameters():
+            # 跳过不需要优化的参数
+            if not param.requires_grad:
+                continue
+
+            # 根据参数维度和层类型判断
+            if len(param.shape) == 2:
+                # 进一步过滤：排除 Embedding 层和 LM Head 等
+                if "embedding" in name.lower() or "embed" in name.lower():
+                    other_params.append(param)
+                elif (
+                    "head" in name.lower()
+                    or "classifier" in name.lower()
+                    or "lm_head" in name.lower()
+                ):
+                    other_params.append(param)
+                else:
+                    # 检查是否为线性层权重（通常 bias 是 1D，权重是 2D）
+                    if "weight" in name and "bias" not in name:
+                        muon_params.append(param)
+                    else:
+                        other_params.append(param)
+                # muon_params.append(param)
+            else:
+                # 1D、3D 及更高维参数都不适合 Muon
+                other_params.append(param)
+
+        # Muon With Aux AdamW
+        optimizers = [
+            torch.optim.Muon(
+                muon_params,
+                lr=self.config.learning_rate,
+                adjust_lr_fn="match_rms_adamw",
+                weight_decay=0.005,
+            ),
+            torch.optim.AdamW(
+                other_params,
+                lr=self.config.learning_rate,
+                amsgrad=False,
+                betas=(0.85, 0.999),
+                eps=1e-6,
+                weight_decay=0.005,
+            ),
+        ]
+
+        # Full AdamW
+        # optimizers = [
+        #     torch.optim.AdamW(
+        #         self.model.parameters(),
+        #         lr=self.config.learning_rate,
+        #         amsgrad=False,
+        #     )
+        # ]
+
+
+        schedulers = [
+            WarmUpCosineLR(
+                optimizer,
+                total_epochs=(
+                    self.config.epochs
+                    * (len(self.train_loader) // self.config.batch_acceleration + 1)
+                )
+                + 1,
+                warmup_epochs=self.config.warmup_steps,
+                min_lr=self.config.min_learning_rate,
+            ) for optimizer in optimizers]
+            
+        return optimizers, schedulers
 
     def save_checkpoint(self, path: str, is_final: bool = False):
         # 检测是否是DataParallel模式
@@ -191,13 +249,20 @@ class PreTrainer:
         else:
             model_state_dict = self.model.state_dict()
         """保存checkpoint"""
+        # 为多个优化器分别保存状态
+        optimizer_states = []
+        scheduler_states = []
+        for opt, sched in zip(self.optimizers, self.schedulers):
+            optimizer_states.append(opt.state_dict())
+            scheduler_states.append(sched.state_dict())
+        
         state = {
             "epoch": self.current_epoch,
             "global_step": self.global_step,
             "current_step": self.current_step,
             "model_state_dict": model_state_dict,
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
+            "optimizer_states": optimizer_states,
+            "scheduler_states": scheduler_states,
             "train_loss": self.train_loss_log[-1] if self.train_loss_log else None,
             "rng_states": {
                 "torch": torch.get_rng_state(),
@@ -221,8 +286,24 @@ class PreTrainer:
 
         # 恢复模型状态
         self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        
+        # 加载多个优化器的状态
+        if "optimizer_states" in checkpoint and checkpoint["optimizer_states"]:
+            for i, opt_state in enumerate(checkpoint["optimizer_states"]):
+                if i < len(self.optimizers):
+                    self.optimizers[i].load_state_dict(opt_state)
+        else:
+            # 兼容旧版本checkpoint
+            self.optimizers.load_state_dict(checkpoint["optimizer_state_dict"])
+            
+        # 加载多个调度器的状态
+        if "scheduler_states" in checkpoint and checkpoint["scheduler_states"]:
+            for i, sched_state in enumerate(checkpoint["scheduler_states"]):
+                if i < len(self.schedulers):
+                    self.schedulers[i].load_state_dict(sched_state)
+        else:
+            # 兼容旧版本checkpoint
+            self.schedulers.load_state_dict(checkpoint["scheduler_state_dict"])
 
         # 恢复训练状态
         self.current_epoch = checkpoint["epoch"]
@@ -258,12 +339,20 @@ class PreTrainer:
         if ((self.current_step + 1) % self.config.batch_acceleration == 0) or (
             self.current_step + 1 == len(self.train_loader)
         ):
-            self.scaler.unscale_(self.optimizer)
+            # 对每个优化器进行梯度缩放和更新
+            for optimizer in self.optimizers:
+                self.scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.scaler.step(self.optimizer)
+            # 对每个优化器单独执行step
+            for optimizer in self.optimizers:
+                self.scaler.step(optimizer)
             self.scaler.update()
-            self.optimizer.zero_grad(set_to_none=True)
-            self.scheduler.step()
+            # 对每个优化器单独清零梯度
+            for optimizer in self.optimizers:
+                optimizer.zero_grad(set_to_none=True)
+            # 对每个调度器单独执行step
+            for scheduler in self.schedulers:
+                scheduler.step()
 
         return loss.item() * self.config.batch_acceleration
 
@@ -325,14 +414,15 @@ class PreTrainer:
                 # 添加TensorBoard训练损失记录
                 writer.add_scalar("Loss/train", loss, self.global_step)
                 # 记录学习率时添加step信息
+                # 由于有多个优化器，我们记录第一个优化器的学习率
                 self.lr_log.append(
-                    (self.global_step, float(self.scheduler.get_last_lr()[0]))
+                    (self.global_step, float(self.schedulers[0].get_last_lr()[0]))
                 )
                 self.global_step += 1
                 # 添加TensorBoard学习率记录
                 writer.add_scalar(
                     "LearningRate",
-                    float(self.scheduler.get_last_lr()[0]),
+                    float(self.schedulers[0].get_last_lr()[0]),
                     self.global_step,
                 )
 
@@ -347,9 +437,7 @@ class PreTrainer:
 
                 # 进度显示
                 bar.update(1)
-                bar.postfix = f"train_loss: {loss:.2f} test_loss: {val_loss:.2f} lr: {self.scheduler.get_last_lr()[0]:.2e}"
-
-                   
+                bar.postfix = f"train_loss: {loss:.2f} test_loss: {val_loss:.2f} lr: {self.schedulers[0].get_last_lr()[0]:.2e}"
 
                 # 每n步直接保存checkpoint
                 if self.global_step % self.config.ckpt_interval_step == 0:
@@ -379,8 +467,8 @@ class PreTrainer:
             writer.add_text(
                 "GeneratedText", f"epoch_{epoch}: {test_text}", self.global_step
             )
+            print(f"学习率{self.schedulers[0].get_last_lr()}")
 
-            print(f"学习率{self.scheduler.get_last_lr()}")
             print(
                 f"Epoch: {epoch+1}/{self.config.epochs}, avg_train_loss: {train_loss_sum/len(self.train_loader)}, avg_test_loss: {val_loss}"
             )
