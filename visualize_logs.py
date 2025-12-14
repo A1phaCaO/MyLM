@@ -1,14 +1,13 @@
 import json
-import matplotlib.pyplot as plt
 from datetime import datetime
 from pathlib import Path
+import matplotlib.pyplot as plt
 from matplotlib import rcParams
 import matplotlib.font_manager as fm
-import platform
-import os
 
-rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS']
-# 修复负号
+# 设置中文字体
+rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+# 修复负号显示
 rcParams['axes.unicode_minus'] = False
 
 
@@ -370,7 +369,8 @@ def plot_multiple_logs_combined(log_files, labels=None, title="Training and Vali
         figsize (tuple): 图表大小
         save_path (str, optional): 保存图片的路径
     # 重新应用中文字体设置，确保不被seaborn覆盖
-    set_chinese_font()
+    rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+    rcParams['axes.unicode_minus'] = False
     """
     plt.figure(figsize=figsize)
     
@@ -468,20 +468,16 @@ if __name__ == '__main__':
     
     # 在这里指定要可视化的日志文件路径
     log_files = [
-        r'logs\GPT2Baseline_20250923_202232.json',
-        r'logs\LLaMABaseline_20250923_202753.json',
-        # r'logs\MyLM(w- MyPE + RoPE)_20250923_210018.json',
-        # r'logs\MyLM(w- RoPE)_20250923_210520.json',
-        # r'logs\MyLM(w- RoPE)_20250923_211045.json',
-        # r'logs\MyLM(w- llama+normal_init)_20250923_213313.json',
-        # r'logs\MyLM(w- align llama+normal_init)_20250923_215837.json',
-        # r'logs\MyLM(w- remake+init)_20250923_233911.json',
-        # r'logs\MyLM(w- remake+init)_20250924_125536.json',
-        # r'logs\MyLM(new init)_20250924_134254.json',
-        # r'logs\MyLM(Att normal + FFN He)_20250924_154224.json'
-        r'logs\LLaMABaseline(Large)_20250924_160746.json',
-        r'logs\MyLM(Large)_20250924_161301.json'
-        
+        r'logs\LLaMABaseline(w- AdamW9e-3)_20251214_133702.json',
+        # r'logs\LLaMABaseline(w- Muon9e-3)_20251214_145038.json',
+        # r'logs\LLaMABaseline(w- Muon2d 9e-3)_20251214_150312.json',
+        # r'logs\LLaMABaseline(w- Muon2dsync 9e-3)_20251214_151144.json',
+        r'logs\LLaMABaseline(w- Muonsync 9e-3)_20251214_152251.json',
+        r'logs\LLaMABaseline(w- Muonsync 5e-2)_20251214_153104.json',
+        r'logs\LLaMABaseline_20251102_152549.json',
+        r'logs\LLaMABaseline(w- Muonsync 1e-2)_20251214_153830.json',
+        r'logs\LLaMABaseline(w- Muonsync 2.5e-3)_20251214_154420.json'
+        # r'logs\LLaMABaseline(w- Muon(moonlight))_20251130_165809.json'
     ]
     
     # 调用新的绘图函数，同时显示训练损失和验证损失

@@ -21,7 +21,7 @@ class TextGenerator:
             self.model = model.module
         else:
             self.model = model
-        self.seq_max_len = self.model.model_args.seq_max_len
+        self.seq_max_len = self.model.args.seq_max_len
         self.padding_side = padding_side
         self.tokenizer.enable_padding(direction=padding_side, length=self.seq_max_len)
         self.tokenizer.enable_truncation(max_length=self.seq_max_len, direction=padding_side)

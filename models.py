@@ -23,6 +23,11 @@ class MyLMArgs:
     attn_bias: bool = False
     d_head: int = 64
     dropout: float = 0.1
+    base_init_std: float = 0.02  # 基础初始化标准差
+    resid_pdrop: float = 0.1  # 残差连接dropout
+    resid_scale: float = 1.0  # 残差流缩放参数
+    layer_scale: float = 1.0  # 层缩放参数
+    use_deepnet_scaling: bool = True  # 是否使用DeepNet缩放策略
 
 
 class RMSNorm(torch.nn.Module):
@@ -30,7 +35,13 @@ class RMSNorm(torch.nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
-
+        self._reset_parameters()
+    
+    def _reset_parameters(self, base_init_std=0.02):
+        # 初始化权重为1
+        with torch.no_grad():
+            self.weight.fill_(1.0)
+    
     def forward(self, x):
         input_dtype = x.dtype
         x = x.to(torch.float32)
@@ -71,10 +82,10 @@ class GPT2PositionEmbedding(nn.Module):
     def __init__(self, seq_max_len, d_model):
         super().__init__()
         self.pos_emb = nn.Embedding(seq_max_len, d_model)
+        self._reset_parameters()
 
-    def _reset_parameters(self):
-        nn.init.normal_(self.pos_emb.weight, std=0.02)
-        # nn.init.normal_(self.up_proj.weight, std=0.01)
+    def _reset_parameters(self, base_init_std=0.02):
+        nn.init.normal_(self.pos_emb.weight, std=base_init_std)
 
     def forward(self, x):
         batch_size, seq_len, d_model = x.shape
@@ -93,7 +104,7 @@ class MyPositionEmbedding(nn.Module):
     def __init__(self, d_model, d_out, d_inner=None):
         super().__init__()
         if d_inner is None:
-            d_inner = d_model // 8
+            d_inner = d_model // 16
         self.d_inner = d_inner
         self.d_model = d_model
         self.gru = nn.GRU(d_inner, d_inner, bias=False, batch_first=True)
@@ -102,10 +113,21 @@ class MyPositionEmbedding(nn.Module):
         self.proj_conv = nn.Conv1d(d_model, d_model - d_inner, 1)
         self.linear = nn.Linear(d_model, d_out, bias=False)
         # self.up_proj = nn.Linear(d_inner, d_model, bias=False)
-        self._reset_parameters()
 
-    def _reset_parameters(self):
-        torch.nn.init.kaiming_normal_(self.linear.weight)
+    def _reset_parameters(self, base_init_std=0.02):
+        torch.nn.init.normal_(self.linear.weight, std=base_init_std)
+        # 初始化其他层的权重
+        if hasattr(self, 'pos_conv') and self.pos_conv.weight is not None:
+            torch.nn.init.normal_(self.pos_conv.weight, std=base_init_std)
+        if hasattr(self, 'proj_conv') and self.proj_conv.weight is not None:
+            torch.nn.init.normal_(self.proj_conv.weight, std=base_init_std)
+        # GRU层的初始化
+        if hasattr(self, 'gru'):
+            for name, param in self.gru.named_parameters():
+                if 'weight' in name:
+                    torch.nn.init.normal_(param, std=base_init_std)
+                elif 'bias' in name:
+                    torch.nn.init.zeros_(param)
 
     def forward(self, x):
         res = x
@@ -116,19 +138,6 @@ class MyPositionEmbedding(nn.Module):
         x = self.linear(torch.cat([pos, x_proj], dim=-1))  # 维度融合
 
         return x + res
-
-
-class TokenShift(nn.Module):
-    def __init__(self, hidden_dim):
-        super().__init__()
-        # 定义填充层：在时间维度上向后滑动一位（如[0,0,1,-1]表示在第三维前补1，后删1）
-        self.pad = nn.ZeroPad2d((0, 0, 1, -1))  # 适用于输入形状为 (B, T, C)
-        self.mix_k = nn.Parameter(torch.zeros(hidden_dim))
-        nn.init.normal_(self.mix_k, mean=0, std=0.01)
-
-    def forward(self, x):
-        xx = self.pad(x) - x  # x_t + xx = x_t-1
-        return x + xx * self.mix_k
 
 
 class ALiBi(nn.Module):
@@ -175,12 +184,11 @@ class ALiBi(nn.Module):
 class Attention(nn.Module):
     """LLaMA 注意力机制"""
 
-    def __init__(self, args: MyLMArgs):
+    def __init__(self, args: MyLMArgs, base_init_std=0.02):
         super().__init__()
         self.d_model = args.d_model
         self.n_heads = args.n_heads or (args.d_model // args.d_head)
         self.d_head = args.d_head
-        assert args.d_model % self.n_heads == 0, "d_model 必须是 n_heads 的整数倍"
         self.seq_max_len = args.seq_max_len
 
         # 注意力投影层
@@ -188,23 +196,18 @@ class Attention(nn.Module):
         self.k_proj = nn.Linear(args.d_model, args.d_model)
         self.v_proj = nn.Linear(args.d_model, args.d_model)
         self.o_proj = nn.Linear(args.d_model, args.d_model)
+        self.gate = nn.Linear(args.d_model, args.d_model)
 
         # RoPE位置编码缓存
-        self.register_buffer("cos_cached", torch.zeros(args.seq_max_len, args.d_head))
-        self.register_buffer("sin_cached", torch.zeros(args.seq_max_len, args.d_head))
-        self._init_rope()
+        self.register_buffer("cos_cached", torch.zeros(1, 1, args.seq_max_len, args.d_head))
+        self.register_buffer("sin_cached", torch.zeros(1, 1, args.seq_max_len, args.d_head))
 
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
-        self._reset_parameters()
-
-    def _reset_parameters(self):
-        """初始化参数"""
-        nn.init.normal_(self.q_proj.weight, std=1/(4*(self.d_model**0.5)))
-        nn.init.normal_(self.k_proj.weight, std=1/(4*(self.d_model**0.5)))
-        nn.init.normal_(self.v_proj.weight, std=1/(4*(self.d_model**0.5)))
-        nn.init.normal_(self.o_proj.weight, std=1/(4*(self.d_model**0.5)))
-
+        
+        # 初始化RoPE
+        self._init_rope()
+        self._reset_parameters(base_init_std=base_init_std)
 
     def _init_rope(self):
         """初始化RoPE位置编码"""
@@ -220,8 +223,17 @@ class Attention(nn.Module):
 
         # 扩展到完整维度并添加批次和头数维度
         emb = torch.cat((freqs, freqs), dim=-1)  # (seq_len, d_head)
-        self.cos_cached = emb.cos().unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, d_head)
-        self.sin_cached = emb.sin().unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, d_head)
+        # 使用register_buffer更新缓存，而不是直接赋值
+        self.register_buffer("cos_cached", emb.cos().unsqueeze(0).unsqueeze(0))  # (1, 1, seq_len, d_head)
+        self.register_buffer("sin_cached", emb.sin().unsqueeze(0).unsqueeze(0))  # (1, 1, seq_len, d_head)
+
+    def _reset_parameters(self, base_init_std=0.02):
+        # 初始化线性层权重
+        torch.nn.init.normal_(self.q_proj.weight, std=base_init_std)
+        torch.nn.init.normal_(self.k_proj.weight, std=base_init_std)
+        torch.nn.init.normal_(self.v_proj.weight, std=base_init_std)
+        torch.nn.init.normal_(self.o_proj.weight, std=base_init_std)
+        torch.nn.init.normal_(self.gate.weight, std=base_init_std)
 
     def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
         """旋转一半维度"""
@@ -249,6 +261,7 @@ class Attention(nn.Module):
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
+        gate = self.gate(x)
 
         # 重塑为多头形式
         q = q.view(batch_size, seq_len, self.n_heads, self.d_head).transpose(
@@ -268,10 +281,8 @@ class Attention(nn.Module):
 
         # 计算注意力分数
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.d_head))
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=att.device)).view(
-            1, 1, seq_len, seq_len
-        )
-        att = att.masked_fill(causal_mask == 0, float("-inf"))
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=att.device)).view(1, 1, seq_len, seq_len)
+        att = att.masked_fill(causal_mask == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
 
@@ -280,7 +291,7 @@ class Attention(nn.Module):
         y = (
             y.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         )  # 重新组合多头
-
+        y = y * F.sigmoid(gate)
         # 输出投影
         y = self.resid_dropout(self.o_proj(y))
         return y
@@ -289,19 +300,21 @@ class Attention(nn.Module):
 class FFN(nn.Module):
     """LLaMA MLP层"""
 
-    def __init__(self, args: MyLMArgs):
+    def __init__(self, args: MyLMArgs, base_init_std=0.02):
         super().__init__()
         self.args = args
         self.gate_proj = nn.Linear(args.d_model, args.d_inner, bias=False)
         self.up_proj = nn.Linear(args.d_model, args.d_inner, bias=False)
         self.down_proj = nn.Linear(args.d_inner, args.d_model, bias=False)
         self.act_fn = nn.SiLU()
-        self._reset_parameters()
+        self._reset_parameters(base_init_std=base_init_std)
 
-    def _reset_parameters(self):
-        torch.nn.init.normal_(self.gate_proj.weight, std=1/((self.args.d_model**0.5)))
-        torch.nn.init.normal_(self.up_proj.weight, std=1/((self.args.d_model**0.5)))
-        torch.nn.init.normal_(self.down_proj.weight, std=1/((self.args.d_inner**0.5)))
+    def _reset_parameters(self, base_init_std=0.02):
+        print('on call _reset_parameters')
+        # 初始化线性层权重
+        torch.nn.init.normal_(self.gate_proj.weight, std=base_init_std)
+        torch.nn.init.normal_(self.up_proj.weight, std=base_init_std)
+        torch.nn.init.normal_(self.down_proj.weight, std=base_init_std)
 
     def forward(self, x: torch.Tensor, token_ids=None) -> torch.Tensor:
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
@@ -318,10 +331,15 @@ class MoEFFN(nn.Module):
         self.args = args
         self.router = nn.Linear(args.d_model, args.n_experts)
         self.experts = nn.ModuleList([FFN(args) for _ in range(args.n_experts)])
-        self._reset_parameters()
 
-    def _reset_parameters(self):
-        torch.nn.init.kaiming_normal_(self.router.weight, nonlinearity="linear")
+    def _reset_parameters(self, base_init_std=0.02):
+        # 路由器使用较小的标准差，避免初始化时偏向特定专家
+        torch.nn.init.normal_(self.router.weight, std=base_init_std * 0.1)
+        if self.router.bias is not None:
+            nn.init.zeros_(self.router.bias)
+        # 初始化所有专家
+        for expert in self.experts:
+            expert._reset_parameters(base_init_std)
 
     def forward(self, x, token_ids=None):
         # 路由块
@@ -339,7 +357,7 @@ class MoEFFN(nn.Module):
         expert_inputs = expert_inputs.repeat_interleave(
             self.args.n_experts_per_tok, dim=0
         )
-        flat_top_k_idx = top_k_indices.view(-1)  # 展平出所有token对应的专家索引
+        flat_top_k_idx = top_k_indices.view(-1) # 展平出所有token对应的专家索引
         expert_outputs = torch.zeros_like(expert_inputs)  # 分配专家输出
 
         # 遍历所有专家 处理对应token
@@ -359,12 +377,14 @@ class MoEFFN(nn.Module):
 class MyLMDecoderLayer(nn.Module):
     """LLaMA Transformer块"""
 
-    def __init__(self, args: MyLMArgs):
+    def __init__(self, args: MyLMArgs, base_init_std=0.02):
         super().__init__()
-        self.attn = Attention(args)
-        self.mlp = MoEFFN(args) if args.use_moe else FFN(args)
+        self.args = args
+        self.attn = Attention(args, base_init_std=base_init_std)
+        self.mlp = MoEFFN(args) if args.use_moe else FFN(args, base_init_std=base_init_std)
         self.input_layernorm = RMSNorm(args.d_model)
         self.post_attention_layernorm = RMSNorm(args.d_model)
+        
 
     def forward(self, x: torch.Tensor, token_ids=None) -> torch.Tensor:
         # 注意力部分
@@ -372,6 +392,7 @@ class MyLMDecoderLayer(nn.Module):
         x = self.input_layernorm(x)
         x = self.attn(x, token_ids=token_ids)
         x = residual + x
+        
 
         # MLP部分
         residual = x
@@ -391,34 +412,28 @@ class MyLM(nn.Module):
     def __init__(self, args: MyLMArgs):
         super().__init__()
         self.args = args
-
+        base_init_std = args.base_init_std
         # 词嵌入层
         self.token_embedding = nn.Embedding(args.vocab_size, args.d_model)
 
         # Transformer块
         self.blocks = nn.ModuleList(
-            [MyLMDecoderLayer(args) for _ in range(args.n_layers)]
+            [MyLMDecoderLayer(args, base_init_std=base_init_std) for _ in range(args.n_layers)]
         )
 
         # 输出层
         self.norm = RMSNorm(args.d_model)
         self.head = nn.Linear(args.d_model, args.vocab_size, bias=False)
+        self._reset_parameters(base_init_std=1/math.sqrt(args.d_model))
 
-        # 权重初始化
-        self._reset_parameters()
-
-    def _reset_parameters(self):
-        """初始化权重"""
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-                if module.bias is not None:
-                    module.bias.data.zero_()
-            elif isinstance(module, nn.Embedding):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        # torch.nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
-        # 特殊处理输出层权重，与嵌入层共享
-        self.head.weight = self.token_embedding.weight
+    def _reset_parameters(self, base_init_std=0.02):
+        torch.nn.init.normal_(self.token_embedding.weight, std=base_init_std)
+        # for module in self.modules():
+            # if isinstance(module, nn.Linear):
+            #     if module.bias is not None:
+            #         module.bias.data.zero_()
+            # if isinstance(module, nn.Embedding):
+            #     torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, x: torch.Tensor, token_ids=None) -> torch.Tensor:
         """
@@ -458,10 +473,17 @@ if __name__ == "__main__":
         seq_max_len=512,
         use_moe=False,
         dropout=0.1,
+        base_init_std=0.02,  # 基础初始化标准差
+        resid_scale=1.0,  # 残差流缩放
+        layer_scale=1.0,  # 层缩放
+        use_deepnet_scaling=True  # 使用DeepNet缩放
     )
 
     # 实例化模型
     model = MyLM(args)
+    
+    # 初始化参数
+    model._reset_parameters()
 
     # 创建测试输入
     bsz = 32
@@ -479,3 +501,27 @@ if __name__ == "__main__":
     ), f"Output shape错误: {outputs.shape}"
     print("测试通过!")
     print(f"输出形状: {outputs.shape}")
+    print(f"模型参数总数: {sum(p.numel() for p in model.parameters())}")
+    
+    # 测试不同的缩放参数
+    print("\n测试不同缩放参数...")
+    args_scaled = MyLMArgs(
+        d_model=256,
+        d_inner=1024,
+        n_layers=4,
+        d_head=64,
+        vocab_size=10000,
+        seq_max_len=256,
+        use_moe=False,
+        dropout=0.1,
+        base_init_std=0.02,
+        resid_scale=0.5,  # 测试较小的残差缩放
+        layer_scale=1.0,
+        use_deepnet_scaling=True
+    )
+    
+    model_scaled = MyLM(args_scaled)
+    model_scaled._reset_parameters()
+    outputs_scaled = model_scaled(input_ids[:, :64])  # 使用较短序列
+    print(f"缩放模型输出形状: {outputs_scaled.shape}")
+    print("缩放模型测试通过!")

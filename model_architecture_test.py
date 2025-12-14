@@ -21,22 +21,22 @@ class ModelTestConfig:
     """模型测试配置参数"""
 
     # 数据配置
-    data_dir: str = r"data_large_ChatML.txt"
+    data_dir: str = r"nano_test_data180.txt"
     tokenizer_dir: str = r"bpe_tokenizer_6k_0724_ChatML.json"
     log_dir: str = r"logs"
-    dataset_downsample: float = 0.006
-    seq_max_len: int = 192
-    valset_rate: float = 0.007
+    dataset_downsample: float = 1
+    seq_max_len: int = 180
+    valset_rate: float = 0.006
 
     # 训练参数
     seed: int = 43
     epochs: int = 1
     batch_size: int = 32
     batch_acceleration: int = 2
-    val_interval: int = 200  # 每N步进行一次验证
+    val_interval: int = 150  # 每N步进行一次验证
 
     # 优化参数
-    learning_rate: float = 3e-4
+    learning_rate: float = 2.5e-3
     use_amp: bool = False
 
     # 模型参数
@@ -57,14 +57,15 @@ class ModelTestConfig:
             ffn_bias=False,
             attn_bias=True,
             dropout=0.1,
+            base_init_std=0.02,
         )
     )
 
     # 新增：模型类
-    model_class: Type = MyLM
+    model_class: Type = LLaMABaseline
 
     # 新增：备注信息
-    notes: str = "Large" 
+    notes: str = "w/ Muonsync 2.5e-3"
 
 
 class ModelArchitectureTester:
@@ -160,21 +161,71 @@ class ModelArchitectureTester:
 
     def _build_optimizer(self):
         """构建优化器"""
-        optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.config.learning_rate,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-            weight_decay=0.01,
-        )
-        return optimizer
+        muon_params = []
+        other_params = []
+
+        # 遍历所有命名参数
+        for name, param in self.model.named_parameters():
+            # 跳过不需要优化的参数
+            if not param.requires_grad:
+                continue
+
+            # 根据参数维度和层类型判断
+            if len(param.shape) == 2:
+                # 进一步过滤：排除 Embedding 层和 LM Head 等
+                if "embedding" in name.lower() or "embed" in name.lower():
+                    other_params.append(param)
+                elif (
+                    "head" in name.lower()
+                    or "classifier" in name.lower()
+                    or "lm_head" in name.lower()
+                ):
+                    other_params.append(param)
+                else:
+                    # 检查是否为线性层权重（通常 bias 是 1D，权重是 2D）
+                    if "weight" in name and "bias" not in name:
+                        muon_params.append(param)
+                    else:
+                        other_params.append(param)
+                # muon_params.append(param)
+            else:
+                # 1D、3D 及更高维参数都不适合 Muon
+                other_params.append(param)
+        
+        optimizers = [
+            torch.optim.Muon(
+                muon_params,
+                lr=self.config.learning_rate,
+                adjust_lr_fn="match_rms_adamw",
+                weight_decay=0.005,
+
+            ),
+            torch.optim.AdamW(
+                other_params,
+                lr=self.config.learning_rate,
+                amsgrad=False,
+                betas=(0.85, 0.999),
+                eps=1e-6,
+                weight_decay=0.005,
+            ),
+        ]
+        # optimizers = [torch.optim.AdamW(
+        #     self.model.parameters(),
+        #     lr=self.config.learning_rate,
+        #     amsgrad=False,
+        #     betas=(0.85, 0.999),
+        #     eps=1e-6,
+        #     weight_decay=0.005,
+        # )]
+
+        return optimizers
 
     def _train_step(self, inputs, targets):
         """单步训练"""
         self.model.train()
         inputs = inputs.to(self.device)
         targets = targets.to(self.device)
-
+        
         with torch.autocast(str(self.device), enabled=self.config.use_amp):
             output = self.model(inputs)
             loss = self.criterion(
@@ -188,8 +239,11 @@ class ModelArchitectureTester:
             self.global_step + 1 == len(self.train_loader)
         ):
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
+             # 更新所有优化器
+            for optimizer in self.optimizer:
+                optimizer.step()
+            for optimizer in self.optimizer:
+                optimizer.zero_grad()
 
         return loss.item() * self.config.batch_acceleration
 
@@ -256,7 +310,7 @@ class ModelArchitectureTester:
             self.current_epoch = epoch
 
             print(f"开始第 {epoch+1} 轮训练...")
-            
+
             # 训练阶段
             for step, (inputs, targets) in enumerate(self.train_loader):
                 if step == 0:
@@ -301,7 +355,7 @@ class ModelArchitectureTester:
                     self.test_log["training_logs"].append(val_log_entry)
 
                     # 累积验证所花费的时间
-                    
+
                     print(f"Step [{self.global_step}] 验证损失: {val_loss:.6f}")
 
                 if step % 10 == 0:
@@ -309,14 +363,16 @@ class ModelArchitectureTester:
                         f"Epoch [{epoch+1}/{self.config.epochs}], Step [{step}], Loss: {loss:.6f}"
                     )
             # 验证阶段
-            epoch_end_time = time.time()  # 计算并累积epoch切换时间（包括日志打印等非训练时间）
+            epoch_end_time = (
+                time.time()
+            )  # 计算并累积epoch切换时间（包括日志打印等非训练时间）
             val_loss = self._validate()
             self.val_loss_log.append((epoch + 1, val_loss))
             epoch_time = epoch_end_time - epoch_start_time
             print(
                 f"第 {epoch+1} 轮完成 - 验证损失: {val_loss:.6f}, 耗时: {epoch_time:.2f}秒"
             )
-            self.epoch_overhead_time += time.time() - epoch_end_time 
+            self.epoch_overhead_time += time.time() - epoch_end_time
             # 记录验证日志，确保包含val_loss信息
             val_log_entry = {
                 "epoch": epoch + 1,
@@ -329,8 +385,6 @@ class ModelArchitectureTester:
                 "type": "epoch_validation",
             }
             self.test_log["training_logs"].append(val_log_entry)
-            
-            
 
         # 记录训练结束时间和总训练时间
         self.training_end_time = time.time()
@@ -400,7 +454,7 @@ class ModelArchitectureTester:
 def test_model_alignment():
     """测试 MyLM 和 LLaMABaseline 实现的一致性"""
     print("开始测试 MyLM 和 LLaMABaseline 实现的一致性...")
-    
+
     # 创建模型参数
     model_args = MyLMArgs(
         d_model=128,
@@ -419,48 +473,50 @@ def test_model_alignment():
         attn_bias=True,
         dropout=0.1,
     )
-    
+
     # 实例化两个模型
     my_lm_model = MyLM(model_args)
     baseline_model = LLaMABaseline(model_args)
-    
+
     # 确保两个模型在相同的设备上
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     my_lm_model = my_lm_model.to(device)
     baseline_model = baseline_model.to(device)
-    
+
     # 设置为评估模式
     my_lm_model.eval()
     baseline_model.eval()
-    
+
     # 创建测试输入
     batch_size = 2
     seq_length = 128
-    input_ids = torch.randint(0, model_args.vocab_size, (batch_size, seq_length)).to(device)
-    
+    input_ids = torch.randint(0, model_args.vocab_size, (batch_size, seq_length)).to(
+        device
+    )
+
     # 设置随机种子以确保一致性
     torch.manual_seed(42)
     np.random.seed(42)
-    
+
     # 重新初始化 MyLM 模型的权重
     my_lm_model._reset_parameters()
-    
+
     # 重新初始化 LLaMABaseline 模型的权重
     baseline_model._init_weights()
-    
+
     # 强制两个模型使用相同的权重
     # 通过复制 MyLM 的权重到 LLaMABaseline
     my_lm_state_dict = my_lm_model.state_dict()
     baseline_model.load_state_dict(my_lm_state_dict)
-    
+
     # 获取 MyLM 模型的输出
     with torch.no_grad():
         my_lm_output = my_lm_model(input_ids)
-    
+
     # 获取 LLaMABaseline 模型的输出
     with torch.no_grad():
         baseline_output = baseline_model(input_ids)
-    
+
     # 比较输出
     output_diff = torch.max(torch.abs(my_lm_output - baseline_output)).item()
     if torch.allclose(my_lm_output, baseline_output, atol=1e-6):
@@ -473,30 +529,41 @@ def test_model_alignment():
         print(f"  MyLM 输出形状: {my_lm_output.shape}")
         print(f"  LLaMABaseline 输出形状: {baseline_output.shape}")
         print(f"  输出差异的最大值: {output_diff}")
-        
+
         # 比较模型参数
         print("\n模型参数比较:")
         my_lm_params = list(my_lm_model.named_parameters())
         baseline_params = list(baseline_model.named_parameters())
-        
+
         if len(my_lm_params) != len(baseline_params):
-            print(f"  参数数量不一致: MyLM={len(my_lm_params)}, LLaMABaseline={len(baseline_params)}")
+            print(
+                f"  参数数量不一致: MyLM={len(my_lm_params)}, LLaMABaseline={len(baseline_params)}"
+            )
         else:
             print(f"  参数数量一致: {len(my_lm_params)}")
             # 比较前几个参数的名称和形状
-            for i, ((name1, param1), (name2, param2)) in enumerate(zip(my_lm_params[:5], baseline_params[:5])):
-                print(f"  参数 {i+1}: MyLM.{name1} {param1.shape} vs LLaMABaseline.{name2} {param2.shape}")
-        
+            for i, ((name1, param1), (name2, param2)) in enumerate(
+                zip(my_lm_params[:5], baseline_params[:5])
+            ):
+                print(
+                    f"  参数 {i+1}: MyLM.{name1} {param1.shape} vs LLaMABaseline.{name2} {param2.shape}"
+                )
+
         # 检查是否有共享权重
         print("\n共享权重检查:")
-        print(f"  MyLM 是否共享权重: {my_lm_model.head.weight is my_lm_model.token_embedding.weight}")
-        print(f"  LLaMABaseline 是否共享权重: {baseline_model.head.weight is baseline_model.token_embedding.weight}")
-        
+        print(
+            f"  MyLM 是否共享权重: {my_lm_model.head.weight is my_lm_model.token_embedding.weight}"
+        )
+        print(
+            f"  LLaMABaseline 是否共享权重: {baseline_model.head.weight is baseline_model.token_embedding.weight}"
+        )
+
         return False
 
 
 if __name__ == "__main__":
     import sys
+
     if len(sys.argv) > 1 and sys.argv[1] == "align":
         # 测试模型对齐
         test_model_alignment()

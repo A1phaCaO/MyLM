@@ -1,0 +1,47 @@
+{
+  "by_loss": {
+    "init_std": 0.7,
+    "resid_scale": 1.0,
+    "layer_scale": 1.0,
+    "use_deepnet_scaling": false,
+    "val_loss": 8.72116756439209,
+    "grad_norm": 0.002407256813590241,
+    "output_variance": 7.19256786396727e-05,
+    "activation_mean": -5.976015523856404e-05,
+    "activation_var": 9.495435105755234e-06,
+    "all_val_losses": [
+      8.72116756439209
+    ],
+    "timestamp": 1758714544.967924
+  },
+  "by_stability": {
+    "init_std": 0.7,
+    "resid_scale": 1.0,
+    "layer_scale": 1.0,
+    "use_deepnet_scaling": true,
+    "val_loss": 8.721869468688965,
+    "grad_norm": 0.0027716779907599578,
+    "output_variance": 3.978476161137223e-05,
+    "activation_mean": -4.345181840470502e-05,
+    "activation_var": 5.566659276201591e-06,
+    "all_val_losses": [
+      8.721868515014648
+    ],
+    "timestamp": 1758714585.705003
+  },
+  "combined": {
+    "init_std": 0.7,
+    "resid_scale": 1.0,
+    "layer_scale": 1.0,
+    "use_deepnet_scaling": true,
+    "val_loss": 8.721869468688965,
+    "grad_norm": 0.0027716779907599578,
+    "output_variance": 3.978476161137223e-05,
+    "activation_mean": -4.345181840470502e-05,
+    "activation_var": 5.566659276201591e-06,
+    "all_val_losses": [
+      8.721868515014648
+    ],
+    "timestamp": 1758714585.705003
+  }
+}
