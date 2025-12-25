@@ -96,17 +96,29 @@ class SFTTrainer(ContinueTrainer):
         self, seq: torch.Tensor[int], subseq: torch.Tensor[int]
     ) -> torch.Tensor[int]:
         """
-        找到子串在序列中的最后一个位置
+        找到子串在序列中的所有位置
         """
+        if len(subseq) == 0:
+            return torch.tensor([], dtype=torch.long, device=seq.device)
+        
         # 创建滑动窗口视图 (seq_len - sub_len + 1, sub_len)
+        if len(seq) < len(subseq):
+            return torch.tensor([], dtype=torch.long, device=seq.device)
+        
         windows = seq.unfold(0, len(subseq), 1)
         # 比较每个窗口与子序列
         matches = (windows == subseq).all(dim=1)
         # 获取匹配位置的索引
-        pos = (torch.nonzero(matches, as_tuple=False).squeeze(dim=1) + 1) * len(
-            self.answer_start_ids
-        ) - 1
-        return pos
+        match_indices = torch.nonzero(matches, as_tuple=False).squeeze(dim=1)
+        
+        if match_indices.numel() == 0:  # 没有找到匹配
+            return torch.tensor([], dtype=torch.long, device=seq.device)
+        elif match_indices.dim() == 0:  # 只有一个匹配
+            match_indices = match_indices.unsqueeze(0)
+        
+        # 返回每个匹配的结束位置（子序列最后一个元素的索引）
+        positions = match_indices + len(subseq) - 1
+        return positions
 
     def _create_loss_mask(self, inputs):
         """
@@ -119,25 +131,113 @@ class SFTTrainer(ContinueTrainer):
         batch_size, seq_len = inputs.shape
         loss_mask = torch.zeros_like(inputs)
         for i, seq in enumerate(inputs):
-            # 第一步：回答不mask
-            ans_start_pos = self._find_subsequence(seq, self.answer_start_ids)
-            ans_end_pos = self._find_subsequence(seq, self.eos_ids)
-            loss_mask[i, ans_start_pos + 1 : ans_end_pos - 1] = 1
+            # 第一步：找到回答的开始和结束位置，并对回答内容设置mask为1
+            ans_start_pos_list = self._find_subsequence(seq, self.answer_start_ids)
+            ans_end_pos_list = self._find_subsequence(seq, self.eos_ids)
             
-            # 第二步：特殊token不mask
-            bos_pos = self._find_subsequence(seq, self.bos_ids)
-            loss_mask[i, bos_pos] = 1
-            eos_pos = self._find_subsequence(seq, self.eos_ids)
-            loss_mask[i, eos_pos] = 1
-            end_pos = self._find_subsequence(seq, self.end_ids)
-            loss_mask[i, end_pos] = 1
+            # 如果找到了回答开始和结束位置，则对回答内容设置mask为1
+            if len(ans_start_pos_list) > 0:
+                # 对于每个问答对，设置回答内容的mask为1
+                for j, ans_start_pos in enumerate(ans_start_pos_list):
+                    # 找到对应的回答结束位置（下一个eos或最后一个eos）
+                    if j < len(ans_end_pos_list):
+                        ans_end_pos = ans_end_pos_list[j]
+                    elif len(ans_end_pos_list) > 0:
+                        # 如果开始位置比结束位置多，使用最后一个结束位置
+                        ans_end_pos = ans_end_pos_list[-1]
+                    else:
+                        # 如果没有对应的结束位置，使用序列末尾
+                        ans_end_pos = seq_len - 1
+                    
+                    # 设置回答内容的mask为1（从回答开始的下一个位置到回答结束位置）
+                    start_idx = min(ans_start_pos + 1, seq_len - 1)
+                    end_idx = min(ans_end_pos + 1, seq_len)  # +1 因为切片是左闭右开
+                    if start_idx < seq_len and end_idx > start_idx:
+                        loss_mask[i, start_idx:end_idx] = 1
+            
+            # 第二步：特殊token不mask，即设置mask为1（表示参与损失计算）
+            bos_pos_list = self._find_subsequence(seq, self.bos_ids)
+            for pos in bos_pos_list:
+                if pos < seq_len:
+                    loss_mask[i, pos] = 1
+                    
+            eos_pos_list = self._find_subsequence(seq, self.eos_ids)
+            for pos in eos_pos_list:
+                if pos < seq_len:
+                    loss_mask[i, pos] = 1
+                    
+            end_pos_list = self._find_subsequence(seq, self.end_ids)
+            for pos in end_pos_list:
+                if pos < seq_len:
+                    loss_mask[i, pos] = 1
 
             
 
         return loss_mask
 
     def _train_step(self, inputs, targets):
-        NotImplementedError("TODO: 把mask引入训练")
+        """单步训练（含梯度累加）"""
+        self.model.train()
+        inputs = inputs.to(self.device)
+        targets = targets.to(self.device)
+
+        # 创建loss mask
+        loss_mask = self._create_loss_mask(inputs)
+
+        with torch.autocast(str(self.device), enabled=self.config.use_amp):
+            output = self.model(inputs)
+            # 使用自定义的损失函数，reduction='none'以应用mask
+            loss_per_token = self.criterion(
+                output.view(-1, self.config.model_args.vocab_size), targets.view(-1)
+            )
+            # 应用loss mask
+            masked_loss = loss_per_token * loss_mask.view(-1)
+            # 计算平均损失，只考虑mask为1的位置
+            loss = masked_loss.sum() / (loss_mask.sum() + 1e-8)  # 防止除零
+
+        loss = loss / self.config.batch_acceleration
+
+        self.scaler.scale(loss).backward()
+        # 梯度裁剪（可选）
+
+        if ((self.current_step + 1) % self.config.batch_acceleration == 0) or (
+            self.current_step + 1 == len(self.train_loader)
+        ):
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
+            self.scheduler.step()
+
+        return loss.item() * self.config.batch_acceleration
+
+    def validate(self) -> float:
+        """验证过程，使用loss mask进行SFT验证"""
+        self.model.eval()
+        val_loss_sum = 0
+        with torch.no_grad():
+            for val_inputs, val_targets in self.val_loader:
+                val_inputs = val_inputs.to(self.device)
+                val_targets = val_targets.to(self.device)
+                
+                # 创建loss mask
+                loss_mask = self._create_loss_mask(val_inputs)
+                
+                with torch.autocast(str(self.device), enabled=self.config.use_amp):
+                    val_output = self.model(val_inputs)
+                    # 使用自定义的损失函数，reduction='none'以应用mask
+                    loss_per_token = self.criterion(
+                        val_output.view(-1, self.config.model_args.vocab_size),
+                        val_targets.view(-1),
+                    )
+                    # 应用loss mask
+                    masked_loss = loss_per_token * loss_mask.view(-1)
+                    # 计算平均损失，只考虑mask为1的位置
+                    loss = masked_loss.sum() / (loss_mask.sum() + 1e-8)  # 防止除零
+                    
+                val_loss_sum += loss.item()
+        return val_loss_sum / len(self.val_loader)
 
 
 if __name__ == "__main__":
