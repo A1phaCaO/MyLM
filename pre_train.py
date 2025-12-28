@@ -38,7 +38,7 @@ class TrainingConfig:
     """训练配置参数"""
 
     # 数据配置
-    data_dir: str = r"nano_test_data180.txt"
+    data_dir: str = r"mini_data200.txt"
     tokenizer_dir: str = r"bpe_tokenizer_6k_0724_ChatML.json"
     model_save_dir: str = r"model\model_state.pth"
     ckpt_save_dir: str = r"ckpt\ckpt.pth"
@@ -48,24 +48,24 @@ class TrainingConfig:
 
     # 训练参数
     seed: int = 42
-    epochs: int = 3
+    epochs: int = 1
     batch_size: int = 16
-    batch_acceleration: int = 8
-    dataset_downsample: int = 0.3
-    valset_rate: float = 0.01
-    val_interval_step: int = 1000
-    seq_max_len = 180
+    batch_acceleration: int = 6
+    dataset_downsample: int = 0.03
+    valset_rate: float = 0.005
+    val_interval_step: int = 800
+    seq_max_len = 200
 
     # 优化参数
-    learning_rate: float = 3.5e-3
-    min_learning_rate: float = 3.5e-4
+    learning_rate: float = 8e-3
+    min_learning_rate: float = 1e-4
     warmup_steps: int = 1
     use_amp: bool = False
 
     model_args = MyLMArgs(
-        d_model=512,
-        d_inner=int(((512 * (6 / 3)) // 64) * 64),
-        d_head=128,
+        d_model=384,
+        d_inner=int(((384 * (6 / 3)) // 64) * 64),
+        d_head=96,
         n_heads=None,
         n_layers=3,
         vocab_size=None,
@@ -220,11 +220,11 @@ class PreTrainer:
 
         # Full AdamW
         # optimizers = [
-        #     torch.optim.AdamW(
-        #         self.model.parameters(),
-        #         lr=self.config.learning_rate,
-        #         amsgrad=False,
-        #     )
+            # torch.optim.AdamW(
+            #     self.model.parameters(),
+            #     lr=self.config.learning_rate,
+            #     amsgrad=False,
+            # )
         # ]
 
 

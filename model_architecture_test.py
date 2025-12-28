@@ -32,7 +32,7 @@ class ModelTestConfig:
     seed: int = 43
     epochs: int = 1
     batch_size: int = 32
-    batch_acceleration: int = 2
+    batch_acceleration: int = 1
     val_interval: int = 150  # 每N步进行一次验证
 
     # 优化参数
@@ -48,7 +48,7 @@ class ModelTestConfig:
             n_heads=None,
             n_layers=2,
             vocab_size=None,
-            seq_max_len=192,
+            seq_max_len=180,
             use_moe=False,
             n_experts=None,
             n_experts_per_tok=None,
@@ -62,10 +62,10 @@ class ModelTestConfig:
     )
 
     # 新增：模型类
-    model_class: Type = LLaMABaseline
+    model_class: Type = MyLM
 
     # 新增：备注信息
-    notes: str = "w/ Muonsync 2.5e-3"
+    notes: str = " w/ (Muon+hybrid+relu^2 l)"
 
 
 class ModelArchitectureTester:

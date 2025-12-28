@@ -468,15 +468,18 @@ if __name__ == '__main__':
     
     # 在这里指定要可视化的日志文件路径
     log_files = [
-        r'logs\LLaMABaseline(w- AdamW9e-3)_20251214_133702.json',
+        # r'logs\LLaMABaseline(w- AdamW9e-3)_20251214_133702.json',
         # r'logs\LLaMABaseline(w- Muon9e-3)_20251214_145038.json',
         # r'logs\LLaMABaseline(w- Muon2d 9e-3)_20251214_150312.json',
         # r'logs\LLaMABaseline(w- Muon2dsync 9e-3)_20251214_151144.json',
-        r'logs\LLaMABaseline(w- Muonsync 9e-3)_20251214_152251.json',
-        r'logs\LLaMABaseline(w- Muonsync 5e-2)_20251214_153104.json',
-        r'logs\LLaMABaseline_20251102_152549.json',
-        r'logs\LLaMABaseline(w- Muonsync 1e-2)_20251214_153830.json',
-        r'logs\LLaMABaseline(w- Muonsync 2.5e-3)_20251214_154420.json'
+        # r'logs\LLaMABaseline(w- Muonsync 2.5e-3)_20251214_154420.json',
+        # r'logs\MyLM(w- (Muon+Gate))_20251228_130246.json',
+        r'logs\MyLM( w- (Muon+act_attn))_20251228_142613.json',
+        r'logs\MyLM( w- (Muon+hybrid))_20251228_143156.json',
+        r'logs\MyLM( w- (Muon+gated))_20251228_143907.json',
+        r'logs\MyLM( w- (Muon+hybrid+relu^2))_20251228_150459.json',
+        r'logs\MyLM( w- (Muon+hybrid+relu^2 l))_20251228_151251.json'
+
         # r'logs\LLaMABaseline(w- Muon(moonlight))_20251130_165809.json'
     ]
     

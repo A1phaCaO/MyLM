@@ -36,12 +36,12 @@ class RMSNorm(torch.nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
         self._reset_parameters()
-    
+
     def _reset_parameters(self, base_init_std=0.02):
         # 初始化权重为1
         with torch.no_grad():
             self.weight.fill_(1.0)
-    
+
     def forward(self, x):
         input_dtype = x.dtype
         x = x.to(torch.float32)
@@ -117,16 +117,16 @@ class MyPositionEmbedding(nn.Module):
     def _reset_parameters(self, base_init_std=0.02):
         torch.nn.init.normal_(self.linear.weight, std=base_init_std)
         # 初始化其他层的权重
-        if hasattr(self, 'pos_conv') and self.pos_conv.weight is not None:
+        if hasattr(self, "pos_conv") and self.pos_conv.weight is not None:
             torch.nn.init.normal_(self.pos_conv.weight, std=base_init_std)
-        if hasattr(self, 'proj_conv') and self.proj_conv.weight is not None:
+        if hasattr(self, "proj_conv") and self.proj_conv.weight is not None:
             torch.nn.init.normal_(self.proj_conv.weight, std=base_init_std)
         # GRU层的初始化
-        if hasattr(self, 'gru'):
+        if hasattr(self, "gru"):
             for name, param in self.gru.named_parameters():
-                if 'weight' in name:
+                if "weight" in name:
                     torch.nn.init.normal_(param, std=base_init_std)
-                elif 'bias' in name:
+                elif "bias" in name:
                     torch.nn.init.zeros_(param)
 
     def forward(self, x):
@@ -182,7 +182,7 @@ class ALiBi(nn.Module):
 
 
 class Attention(nn.Module):
-    """LLaMA 注意力机制"""
+    """带有sigmoid激活的LLaMA 注意力机制"""
 
     def __init__(self, args: MyLMArgs, base_init_std=0.02):
         super().__init__()
@@ -196,18 +196,28 @@ class Attention(nn.Module):
         self.k_proj = nn.Linear(args.d_model, args.d_model)
         self.v_proj = nn.Linear(args.d_model, args.d_model)
         self.o_proj = nn.Linear(args.d_model, args.d_model)
-        self.gate = nn.Linear(args.d_model, args.d_model)
 
         # RoPE位置编码缓存
-        self.register_buffer("cos_cached", torch.zeros(1, 1, args.seq_max_len, args.d_head))
-        self.register_buffer("sin_cached", torch.zeros(1, 1, args.seq_max_len, args.d_head))
+        self.register_buffer(
+            "cos_cached", torch.zeros(1, 1, args.seq_max_len, args.d_head)
+        )
+        self.register_buffer(
+            "sin_cached", torch.zeros(1, 1, args.seq_max_len, args.d_head)
+        )
 
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
-        
+
         # 初始化RoPE
         self._init_rope()
         self._reset_parameters(base_init_std=base_init_std)
+
+    def _reset_parameters(self, base_init_std=0.02):
+        # 初始化线性层权重
+        torch.nn.init.normal_(self.q_proj.weight, std=base_init_std)
+        torch.nn.init.normal_(self.k_proj.weight, std=base_init_std)
+        torch.nn.init.normal_(self.v_proj.weight, std=base_init_std)
+        torch.nn.init.normal_(self.o_proj.weight, std=base_init_std)
 
     def _init_rope(self):
         """初始化RoPE位置编码"""
@@ -224,16 +234,12 @@ class Attention(nn.Module):
         # 扩展到完整维度并添加批次和头数维度
         emb = torch.cat((freqs, freqs), dim=-1)  # (seq_len, d_head)
         # 使用register_buffer更新缓存，而不是直接赋值
-        self.register_buffer("cos_cached", emb.cos().unsqueeze(0).unsqueeze(0))  # (1, 1, seq_len, d_head)
-        self.register_buffer("sin_cached", emb.sin().unsqueeze(0).unsqueeze(0))  # (1, 1, seq_len, d_head)
-
-    def _reset_parameters(self, base_init_std=0.02):
-        # 初始化线性层权重
-        torch.nn.init.normal_(self.q_proj.weight, std=base_init_std)
-        torch.nn.init.normal_(self.k_proj.weight, std=base_init_std)
-        torch.nn.init.normal_(self.v_proj.weight, std=base_init_std)
-        torch.nn.init.normal_(self.o_proj.weight, std=base_init_std)
-        torch.nn.init.normal_(self.gate.weight, std=base_init_std)
+        self.register_buffer(
+            "cos_cached", emb.cos().unsqueeze(0).unsqueeze(0)
+        )  # (1, 1, seq_len, d_head)
+        self.register_buffer(
+            "sin_cached", emb.sin().unsqueeze(0).unsqueeze(0)
+        )  # (1, 1, seq_len, d_head)
 
     def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
         """旋转一半维度"""
@@ -261,7 +267,6 @@ class Attention(nn.Module):
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
-        gate = self.gate(x)
 
         # 重塑为多头形式
         q = q.view(batch_size, seq_len, self.n_heads, self.d_head).transpose(
@@ -281,8 +286,135 @@ class Attention(nn.Module):
 
         # 计算注意力分数
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.d_head))
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=att.device)).view(1, 1, seq_len, seq_len)
-        att = att.masked_fill(causal_mask == 0, float('-inf'))
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=att.device)).view(
+            1, 1, seq_len, seq_len
+        )
+        att = att.masked_fill(causal_mask == 0, float("-inf"))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+
+        # 应用注意力权重
+        y = att @ F.sigmoid(v)  # (batch, heads, seq, head_dim)
+        y = (
+            y.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        )  # 重新组合多头
+        # 输出投影
+        y = self.resid_dropout(self.o_proj(y))
+        return y
+
+
+class GatedAttention(nn.Module):
+    """Qwen 门控注意力机制"""
+
+    def __init__(self, args: MyLMArgs, base_init_std=0.02):
+        super().__init__()
+        self.d_model = args.d_model
+        self.n_heads = args.n_heads or (args.d_model // args.d_head)
+        self.d_head = args.d_head
+        self.seq_max_len = args.seq_max_len
+
+        # 注意力投影层
+        self.q_proj = nn.Linear(args.d_model, args.d_model, bias=args.attn_bias)
+        self.k_proj = nn.Linear(args.d_model, args.d_model, bias=args.attn_bias)
+        self.v_proj = nn.Linear(args.d_model, args.d_model, bias=args.attn_bias)
+        self.o_proj = nn.Linear(args.d_model, args.d_model, bias=args.attn_bias)
+        self.gate = nn.Linear(args.d_model, args.d_model, bias=False)
+
+        # RoPE位置编码缓存
+        self.register_buffer(
+            "cos_cached", torch.zeros(1, 1, args.seq_max_len, args.d_head)
+        )
+        self.register_buffer(
+            "sin_cached", torch.zeros(1, 1, args.seq_max_len, args.d_head)
+        )
+
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+
+        # 初始化RoPE
+        self._init_rope()
+        self._reset_parameters(base_init_std=base_init_std)
+
+    def _reset_parameters(self, base_init_std=0.02):
+        # 初始化线性层权重
+        torch.nn.init.normal_(self.q_proj.weight, std=base_init_std)
+        torch.nn.init.normal_(self.k_proj.weight, std=base_init_std)
+        torch.nn.init.normal_(self.v_proj.weight, std=base_init_std)
+        torch.nn.init.normal_(self.o_proj.weight, std=base_init_std)
+        torch.nn.init.normal_(self.gate.weight, std=base_init_std)
+
+    def _init_rope(self):
+        """初始化RoPE位置编码"""
+        d_head_half = self.d_head // 2
+        # 创建频率数组，长度为d_head_half
+        inv_freq = 1.0 / (
+            10000 ** (torch.arange(0, d_head_half, dtype=torch.float) / d_head_half)
+        )
+
+        t = torch.arange(self.seq_max_len, dtype=torch.float)
+        # 计算位置频率
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+
+        # 扩展到完整维度并添加批次和头数维度
+        emb = torch.cat((freqs, freqs), dim=-1)  # (seq_len, d_head)
+        # 使用register_buffer更新缓存，而不是直接赋值
+        self.register_buffer(
+            "cos_cached", emb.cos().unsqueeze(0).unsqueeze(0)
+        )  # (1, 1, seq_len, d_head)
+        self.register_buffer(
+            "sin_cached", emb.sin().unsqueeze(0).unsqueeze(0)
+        )  # (1, 1, seq_len, d_head)
+
+    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        """旋转一半维度"""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def _apply_rotary_pos_emb(
+        self, q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ):
+        """应用RoPE位置编码"""
+        # 调整cos和sin的维度以匹配q和k的序列长度
+        cos = cos[:, :, : q.size(2), :]  # (1, 1, seq_len, d_head)
+        sin = sin[:, :, : q.size(2), :]  # (1, 1, seq_len, d_head)
+
+        # 将q和k分割为两半用于旋转操作
+        q_embed = (q * cos) + (self._rotate_half(q) * sin)
+        k_embed = (k * cos) + (self._rotate_half(k) * sin)
+        return q_embed, k_embed
+
+    def forward(self, x: torch.Tensor, token_ids=None) -> torch.Tensor:
+        batch_size, seq_len, _ = x.size()
+
+        # 计算QKV
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        gate = F.sigmoid(self.gate(x))
+
+        # 重塑为多头形式
+        q = q.view(batch_size, seq_len, self.n_heads, self.d_head).transpose(
+            1, 2
+        )  # (batch, heads, seq, head_dim)
+        k = k.view(batch_size, seq_len, self.n_heads, self.d_head).transpose(
+            1, 2
+        )  # (batch, heads, seq, head_dim)
+        v = v.view(batch_size, seq_len, self.n_heads, self.d_head).transpose(
+            1, 2
+        )  # (batch, heads, seq, head_dim)
+
+        # 应用RoPE位置编码
+        cos = self.cos_cached[:, :, :seq_len, :]  # (1, 1, seq_len, d_head)
+        sin = self.sin_cached[:, :, :seq_len, :]  # (1, 1, seq_len, d_head)
+        q, k = self._apply_rotary_pos_emb(q, k, cos, sin)
+
+        # 计算注意力分数
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.d_head))
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=att.device)).view(
+            1, 1, seq_len, seq_len
+        )
+        att = att.masked_fill(causal_mask == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
 
@@ -291,11 +423,10 @@ class Attention(nn.Module):
         y = (
             y.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         )  # 重新组合多头
-        y = y * F.sigmoid(gate)
+        y = y * gate
         # 输出投影
         y = self.resid_dropout(self.o_proj(y))
         return y
-
 
 class FFN(nn.Module):
     """LLaMA MLP层"""
@@ -306,19 +437,19 @@ class FFN(nn.Module):
         self.gate_proj = nn.Linear(args.d_model, args.d_inner, bias=False)
         self.up_proj = nn.Linear(args.d_model, args.d_inner, bias=False)
         self.down_proj = nn.Linear(args.d_inner, args.d_model, bias=False)
-        self.act_fn = nn.SiLU()
         self._reset_parameters(base_init_std=base_init_std)
 
     def _reset_parameters(self, base_init_std=0.02):
-        print('on call _reset_parameters')
+        print("on call _reset_parameters")
         # 初始化线性层权重
         torch.nn.init.normal_(self.gate_proj.weight, std=base_init_std)
         torch.nn.init.normal_(self.up_proj.weight, std=base_init_std)
         torch.nn.init.normal_(self.down_proj.weight, std=base_init_std)
 
     def forward(self, x: torch.Tensor, token_ids=None) -> torch.Tensor:
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        y = self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+        return y
 
 
 class MoEFFN(nn.Module):
@@ -357,7 +488,7 @@ class MoEFFN(nn.Module):
         expert_inputs = expert_inputs.repeat_interleave(
             self.args.n_experts_per_tok, dim=0
         )
-        flat_top_k_idx = top_k_indices.view(-1) # 展平出所有token对应的专家索引
+        flat_top_k_idx = top_k_indices.view(-1)  # 展平出所有token对应的专家索引
         expert_outputs = torch.zeros_like(expert_inputs)  # 分配专家输出
 
         # 遍历所有专家 处理对应token
@@ -375,16 +506,24 @@ class MoEFFN(nn.Module):
 
 
 class MyLMDecoderLayer(nn.Module):
-    """LLaMA Transformer块"""
+    """
+    混合Transformer块
+    门控注意力 : v激活注意力 = 1:1
+    """
 
-    def __init__(self, args: MyLMArgs, base_init_std=0.02):
+    def __init__(self, args: MyLMArgs, layer_idx=0, base_init_std=0.02):
         super().__init__()
         self.args = args
-        self.attn = Attention(args, base_init_std=base_init_std)
-        self.mlp = MoEFFN(args) if args.use_moe else FFN(args, base_init_std=base_init_std)
+        self.attn = (
+            GatedAttention(args, base_init_std=base_init_std)
+            if layer_idx % 2 == 0
+            else Attention(args, base_init_std=base_init_std)
+        )
+        self.mlp = (
+            MoEFFN(args) if args.use_moe else FFN(args, base_init_std=base_init_std)
+        )
         self.input_layernorm = RMSNorm(args.d_model)
         self.post_attention_layernorm = RMSNorm(args.d_model)
-        
 
     def forward(self, x: torch.Tensor, token_ids=None) -> torch.Tensor:
         # 注意力部分
@@ -392,7 +531,6 @@ class MyLMDecoderLayer(nn.Module):
         x = self.input_layernorm(x)
         x = self.attn(x, token_ids=token_ids)
         x = residual + x
-        
 
         # MLP部分
         residual = x
@@ -418,22 +556,25 @@ class MyLM(nn.Module):
 
         # Transformer块
         self.blocks = nn.ModuleList(
-            [MyLMDecoderLayer(args, base_init_std=base_init_std) for _ in range(args.n_layers)]
+            [
+                MyLMDecoderLayer(args, layer_idx, base_init_std=base_init_std)
+                for layer_idx in range(args.n_layers)
+            ]
         )
 
         # 输出层
         self.norm = RMSNorm(args.d_model)
         self.head = nn.Linear(args.d_model, args.vocab_size, bias=False)
-        self._reset_parameters(base_init_std=1/math.sqrt(args.d_model))
+        self._reset_parameters(base_init_std=1 / math.sqrt(args.d_model))
 
     def _reset_parameters(self, base_init_std=0.02):
         torch.nn.init.normal_(self.token_embedding.weight, std=base_init_std)
         # for module in self.modules():
-            # if isinstance(module, nn.Linear):
-            #     if module.bias is not None:
-            #         module.bias.data.zero_()
-            # if isinstance(module, nn.Embedding):
-            #     torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        # if isinstance(module, nn.Linear):
+        #     if module.bias is not None:
+        #         module.bias.data.zero_()
+        # if isinstance(module, nn.Embedding):
+        #     torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, x: torch.Tensor, token_ids=None) -> torch.Tensor:
         """
@@ -476,12 +617,12 @@ if __name__ == "__main__":
         base_init_std=0.02,  # 基础初始化标准差
         resid_scale=1.0,  # 残差流缩放
         layer_scale=1.0,  # 层缩放
-        use_deepnet_scaling=True  # 使用DeepNet缩放
+        use_deepnet_scaling=True,  # 使用DeepNet缩放
     )
 
     # 实例化模型
     model = MyLM(args)
-    
+
     # 初始化参数
     model._reset_parameters()
 
@@ -502,7 +643,7 @@ if __name__ == "__main__":
     print("测试通过!")
     print(f"输出形状: {outputs.shape}")
     print(f"模型参数总数: {sum(p.numel() for p in model.parameters())}")
-    
+
     # 测试不同的缩放参数
     print("\n测试不同缩放参数...")
     args_scaled = MyLMArgs(
@@ -517,9 +658,9 @@ if __name__ == "__main__":
         base_init_std=0.02,
         resid_scale=0.5,  # 测试较小的残差缩放
         layer_scale=1.0,
-        use_deepnet_scaling=True
+        use_deepnet_scaling=True,
     )
-    
+
     model_scaled = MyLM(args_scaled)
     model_scaled._reset_parameters()
     outputs_scaled = model_scaled(input_ids[:, :64])  # 使用较短序列
