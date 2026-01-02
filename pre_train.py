@@ -15,9 +15,11 @@ import matplotlib.pyplot as plt
 import tokenizers
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+
 import random
 import gc
 import json
+import time
 
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any
@@ -26,7 +28,13 @@ from typing import Optional, Dict, Any
 # ---------------------------------------------------#
 #   工具组件
 # ---------------------------------------------------#
-from utils import model_structure, TextGenerator, WarmUpCosineLR, DebugTimer
+from utils import (
+    model_structure,
+    TextGenerator,
+    WarmUpCosineLR,
+    WarmUpStableDecayLR,
+    DebugTimer,
+)
 from dataset import TextDatasetV4, RuntimeTextDatasetV4, StreamingTextDataset
 from models import MyLMArgs, MyLM
 
@@ -38,28 +46,30 @@ class TrainingConfig:
     """训练配置参数"""
 
     # 数据配置
-    data_dir: str = r"mini_data200.txt"
+    data_dir: str = r"mini_data200v2.txt"
     tokenizer_dir: str = r"bpe_tokenizer_6k_0724_ChatML.json"
     model_save_dir: str = r"model\model_state.pth"
     ckpt_save_dir: str = r"ckpt\ckpt.pth"
     config_save_dir: str = r"config.json"
-    log_dir: str = r"logs"
+    # log_dir: str = r"logs/" + time.strftime("%Y%m%d-%H%M%S")
+    log_dir: str = r"logs/20260102-143753"
     padding_side = "left"
 
     # 训练参数
     seed: int = 42
     epochs: int = 1
     batch_size: int = 16
-    batch_acceleration: int = 6
-    dataset_downsample: int = 0.03
+    batch_acceleration: int = 3
+    dataset_downsample: int = 0.5
     valset_rate: float = 0.005
     val_interval_step: int = 800
     seq_max_len = 200
 
     # 优化参数
-    learning_rate: float = 8e-3
-    min_learning_rate: float = 1e-4
-    warmup_steps: int = 1
+    learning_rate: float = 4e-3
+    min_learning_rate: float = 5e-5  # WSD LRS衰减到1%
+    lr_decay_start_rate: int = 0.75  # 最后25%衰减
+    warmup_steps: int = 75
     use_amp: bool = False
 
     model_args = MyLMArgs(
@@ -83,8 +93,8 @@ class TrainingConfig:
     # 新增参数：checkpoint保存间隔步数
     ckpt_interval_step: int = 1000
     # 新增参数：断点续训的checkpoint路径
-    # resume_from: Optional[str] = r"ckpt\ckpt_epoch_1_step_27000.pth"
-    resume_from: Optional[str] = None
+    resume_from: Optional[str] = r"ckpt\ckpt_epoch_0_step_6000.pth"
+    # resume_from: Optional[str] = None
 
 
 class PreTrainer:
@@ -154,14 +164,14 @@ class PreTrainer:
             train_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
-            pin_memory=False,
+            pin_memory=True,
             num_workers=4,
         )
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
-            pin_memory=False,
+            pin_memory=True,
             num_workers=1,
         )
 
@@ -220,26 +230,46 @@ class PreTrainer:
 
         # Full AdamW
         # optimizers = [
-            # torch.optim.AdamW(
-            #     self.model.parameters(),
-            #     lr=self.config.learning_rate,
-            #     amsgrad=False,
-            # )
+        # torch.optim.AdamW(
+        #     self.model.parameters(),
+        #     lr=self.config.learning_rate,
+        #     amsgrad=False,
+        # )
         # ]
 
+        total_steps = (
+            self.config.epochs
+            * (len(self.train_loader) // self.config.batch_acceleration + 1)
+        ) + 1
 
+        # WarmUpCosineLR
+        # schedulers = [
+        #     WarmUpCosineLR(
+        #         optimizer,
+        #         total_steps=(
+        #     self.config.epochs
+        #     * (len(self.train_loader) // self.config.batch_acceleration + 1)
+        # ) + 1,
+        #         warmup_steps=self.config.warmup_steps,
+        #         min_lr=self.config.min_learning_rate,
+        #     ) for optimizer in optimizers]
+
+        # WSD学习率调度器
         schedulers = [
-            WarmUpCosineLR(
+            WarmUpStableDecayLR(
                 optimizer,
-                total_epochs=(
-                    self.config.epochs
-                    * (len(self.train_loader) // self.config.batch_acceleration + 1)
-                )
-                + 1,
-                warmup_epochs=self.config.warmup_steps,
+                total_steps=total_steps,
+                warmup_steps=self.config.warmup_steps,
+                stable_steps=int(
+                    self.config.lr_decay_start_rate * total_steps
+                    - self.config.warmup_steps
+                ),
                 min_lr=self.config.min_learning_rate,
-            ) for optimizer in optimizers]
-            
+                decay_mode="exp",
+            )
+            for optimizer in optimizers
+        ]
+
         return optimizers, schedulers
 
     def save_checkpoint(self, path: str, is_final: bool = False):
@@ -255,7 +285,7 @@ class PreTrainer:
         for opt, sched in zip(self.optimizers, self.schedulers):
             optimizer_states.append(opt.state_dict())
             scheduler_states.append(sched.state_dict())
-        
+
         state = {
             "epoch": self.current_epoch,
             "global_step": self.global_step,
@@ -286,7 +316,7 @@ class PreTrainer:
 
         # 恢复模型状态
         self.model.load_state_dict(checkpoint["model_state_dict"])
-        
+
         # 加载多个优化器的状态
         if "optimizer_states" in checkpoint and checkpoint["optimizer_states"]:
             for i, opt_state in enumerate(checkpoint["optimizer_states"]):
@@ -295,7 +325,7 @@ class PreTrainer:
         else:
             # 兼容旧版本checkpoint
             self.optimizers.load_state_dict(checkpoint["optimizer_state_dict"])
-            
+
         # 加载多个调度器的状态
         if "scheduler_states" in checkpoint and checkpoint["scheduler_states"]:
             for i, sched_state in enumerate(checkpoint["scheduler_states"]):
@@ -430,7 +460,12 @@ class PreTrainer:
                 if i % self.config.val_interval_step == 0:
                     val_loss = self.validate()
                     # 文本生成测试
-                    self.generate_test("人工智能是")
+                    test_text = self.generate_test("人工智能是")
+                    writer.add_text(
+                        "GeneratedText",
+                        f"epoch_{epoch}_step{i}: {test_text}",
+                        self.global_step,
+                    )
                     self.val_loss_log.append((self.global_step, val_loss))
                     # 添加TensorBoard验证损失记录
                     writer.add_scalar("Loss/val", val_loss, self.global_step)
@@ -454,7 +489,6 @@ class PreTrainer:
             self.val_loss_log.append((self.global_step, val_loss))
 
             # 文本生成测试
-            self.generate_test()
 
             # 修改：epoch级保存使用更明确的文件名格式
             self.save_checkpoint(
@@ -567,7 +601,7 @@ if __name__ == "__main__":
                         start_token=start,
                         gen_seq_len=MAX_LEN,
                         temperature=T,
-                        frequency_penalty=10,
+                        frequency_penalty=1.5,
                         print_out=False,
                     )
                 )
