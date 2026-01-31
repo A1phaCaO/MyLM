@@ -29,13 +29,13 @@ tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
 
 # 通过字典形式定义路径和对应的下采样率
 path_downsample_dict = {
-    r"train_text\WanJuan1.0part-000036-a894b46e-downsample20x-processed.txt": 40,
-    r"train_text\SkyPile2023-14_zh_head_0000_processed.txt": 40,
-    r"train_text\SkyPile2022-40_zh_middle_0011_processed.txt": 50,
-    r"train_text\SkyPile2023-14_zh_middle_0010_processed.txt": 2,
-    r"train_text\ultrafineweb-zh-part-001-of-256-downsample2x.txt": 4,
-    r"train_text\Infinity-Instruct-Gen-00000-of-00015-sft2pretrain-processed.txt": 60,
-    r"train_text\distill_r1_110k_sft2pretrain_processed.txt": 300,
+    r"train_text\WanJuan1.0part-000036-a894b46e-downsample20x-processed.txt": 15,
+    r"train_text\SkyPile2023-14_zh_head_0000_processed.txt": 5,
+    r"train_text\SkyPile2022-40_zh_middle_0011_processed.txt": 30,
+    r"train_text\SkyPile2023-14_zh_middle_0010_processed.txt": 1,
+    r"train_text\ultrafineweb-zh-part-001-of-256-downsample2x.txt": 1,
+    r"train_text\Infinity-Instruct-Gen-00000-of-00015-sft2pretrain-processed.txt": 20,
+    r"train_text\distill_r1_110k_sft2pretrain_processed.txt": 250,
 }
 
 # 设定句子的最大长度
@@ -51,8 +51,8 @@ SPLIT_SYMBOL = (
     "!",
     "?",
 )
-SPLIT_FROM_SYMBOL = True
-OUTPUT_PATH = r"mini_data200v2.txt"
+SPLIT_FROM_SYMBOL = False
+OUTPUT_PATH = r"large_data200.txt"
 SHUFFLE = True  # 按BATCH_SIZE进行随机打乱
 
 

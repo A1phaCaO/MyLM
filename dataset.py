@@ -10,10 +10,11 @@ import random
 # import tracemalloc
 
 
-class StreamingTextDataset(torch.utils.data.Dataset):
+class PretrainTextDataset(torch.utils.data.Dataset):
     """
     流式文本数据集，避免将整个数据集加载到内存中
     只存储文件路径和行位置信息，在需要时才读取特定行
+    返回格式：(input, output, mask)，其中mask为loss mask，包括pad mask
     """
 
     def __init__(
@@ -92,12 +93,26 @@ class StreamingTextDataset(torch.utils.data.Dataset):
 
         return seq
 
+    def _create_loss_mask(
+        self, padded_seq: list[int], padding_value: int = 0
+    ) -> list[int]:
+        """
+        创建loss mask，用于标识需要计算loss的位置
+        Args:
+            padded_seq: 填充后的序列
+            padding_value: padding的值（通常为0）
+        Returns:
+            mask: 有效位置为1，padding位置为0
+        """
+        return [0 if token == padding_value else 1 for token in padded_seq]
+
     def __len__(self):
         return len(self.line_offsets)
 
     def __getitem__(self, index):
         """
         根据索引获取数据样本，只在需要时读取特定行
+        返回格式：(input, output, mask)
         """
         # 根据索引定位并读取特定行
         with open(self.data_dir, "r", encoding="utf-8") as f:
@@ -123,7 +138,14 @@ class StreamingTextDataset(torch.utils.data.Dataset):
         # 将列表转换为tensor
         raw_tensor = torch.tensor(raw, dtype=torch.long)
 
-        return (raw_tensor[:-1].contiguous(), raw_tensor[1:].contiguous())
+        inputs = raw_tensor[:-1].contiguous()
+        outputs = raw_tensor[1:].contiguous()
+
+        # 生成loss mask（对应output位置）
+        mask = self._create_loss_mask(outputs.cpu().tolist())
+        mask_tensor = torch.tensor(mask, dtype=torch.float32)
+
+        return (inputs, outputs, mask_tensor)
 
 
 class RuntimeTextDatasetV4(torch.utils.data.Dataset):
@@ -536,7 +558,7 @@ class Vocab:
 if __name__ == "__main__":
     import time
 
-    dataset = StreamingTextDataset(
+    dataset = PretrainTextDataset(
         r"data_large_ChatML.txt",
         downsample=10,
         tokenizer=tokenizers.Tokenizer.from_file(r"bpe_tokenizer_6k_0724_ChatML.json"),

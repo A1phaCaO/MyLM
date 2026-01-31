@@ -35,7 +35,7 @@ from utils import (
     WarmUpStableDecayLR,
     DebugTimer,
 )
-from dataset import TextDatasetV4, RuntimeTextDatasetV4, StreamingTextDataset
+from dataset import TextDatasetV4, RuntimeTextDatasetV4, PretrainTextDataset
 from models import MyLMArgs, MyLM
 
 t = DebugTimer()
@@ -51,8 +51,8 @@ class TrainingConfig:
     model_save_dir: str = r"model\model_state.pth"
     ckpt_save_dir: str = r"ckpt\ckpt.pth"
     config_save_dir: str = r"config.json"
-    # log_dir: str = r"logs/" + time.strftime("%Y%m%d-%H%M%S")
-    log_dir: str = r"logs/20260102-143753"
+    log_dir: str = r"logs/" + time.strftime("%Y%m%d-%H%M%S")
+    # log_dir: str = r"logs/20260102-143753"
     padding_side = "left"
 
     # 训练参数
@@ -60,16 +60,16 @@ class TrainingConfig:
     epochs: int = 1
     batch_size: int = 16
     batch_acceleration: int = 3
-    dataset_downsample: int = 0.5
+    dataset_downsample: int = 0.1
     valset_rate: float = 0.005
     val_interval_step: int = 800
     seq_max_len = 200
 
     # 优化参数
-    learning_rate: float = 4e-3
+    learning_rate: float = 5e-3
     min_learning_rate: float = 5e-5  # WSD LRS衰减到1%
     lr_decay_start_rate: int = 0.75  # 最后25%衰减
-    warmup_steps: int = 75
+    warmup_steps: int = 25
     use_amp: bool = False
 
     model_args = MyLMArgs(
@@ -77,7 +77,7 @@ class TrainingConfig:
         d_inner=int(((384 * (6 / 3)) // 64) * 64),
         d_head=96,
         n_heads=None,
-        n_layers=3,
+        n_layers=2,
         vocab_size=None,
         seq_max_len=seq_max_len,
         use_moe=False,
@@ -93,8 +93,8 @@ class TrainingConfig:
     # 新增参数：checkpoint保存间隔步数
     ckpt_interval_step: int = 1000
     # 新增参数：断点续训的checkpoint路径
-    resume_from: Optional[str] = r"ckpt\ckpt_epoch_0_step_6000.pth"
-    # resume_from: Optional[str] = None
+    # resume_from: Optional[str] = r"ckpt\ckpt_epoch_0_step_6000.pth"
+    resume_from: Optional[str] = None
 
 
 class PreTrainer:
@@ -106,7 +106,7 @@ class PreTrainer:
         self.config.model_args.vocab_size = len(self.tokenizer.get_vocab())
         self.train_loader, self.val_loader = self._build_dataloader()
         self.model = self._build_model().to(self.device)
-        self.criterion = nn.CrossEntropyLoss(ignore_index=0)
+        self.criterion = nn.CrossEntropyLoss()
         self.optimizers, self.schedulers = self._build_optimizer()
         self.scaler = torch.GradScaler(self.device, enabled=config.use_amp)
         self.generator = TextGenerator(
@@ -145,7 +145,7 @@ class PreTrainer:
 
     def _build_dataloader(self):
         """构建数据加载器"""
-        dataset = StreamingTextDataset(
+        dataset = PretrainTextDataset(
             self.config.data_dir,
             downsample=self.config.dataset_downsample,
             seq_max_len=self.config.seq_max_len,
@@ -317,6 +317,15 @@ class PreTrainer:
         # 恢复模型状态
         self.model.load_state_dict(checkpoint["model_state_dict"])
 
+        # 加载多个调度器的状态（按照PyTorch文档建议，在优化器之前加载）
+        if "scheduler_states" in checkpoint and checkpoint["scheduler_states"]:
+            for i, sched_state in enumerate(checkpoint["scheduler_states"]):
+                if i < len(self.schedulers):
+                    self.schedulers[i].load_state_dict(sched_state)
+        else:
+            # 兼容旧版本checkpoint
+            self.schedulers.load_state_dict(checkpoint["scheduler_state_dict"])
+
         # 加载多个优化器的状态
         if "optimizer_states" in checkpoint and checkpoint["optimizer_states"]:
             for i, opt_state in enumerate(checkpoint["optimizer_states"]):
@@ -325,15 +334,6 @@ class PreTrainer:
         else:
             # 兼容旧版本checkpoint
             self.optimizers.load_state_dict(checkpoint["optimizer_state_dict"])
-
-        # 加载多个调度器的状态
-        if "scheduler_states" in checkpoint and checkpoint["scheduler_states"]:
-            for i, sched_state in enumerate(checkpoint["scheduler_states"]):
-                if i < len(self.schedulers):
-                    self.schedulers[i].load_state_dict(sched_state)
-        else:
-            # 兼容旧版本checkpoint
-            self.schedulers.load_state_dict(checkpoint["scheduler_state_dict"])
 
         # 恢复训练状态
         self.current_epoch = checkpoint["epoch"]
@@ -349,17 +349,21 @@ class PreTrainer:
         random.setstate(rng_states["random"])
         np.random.set_state(rng_states["numpy"])
 
-    def _train_step(self, inputs, targets):
+    def _train_step(self, inputs, targets, mask):
         """单步训练（含梯度累加）"""
         self.model.train()
         inputs = inputs.to(self.device)
         targets = targets.to(self.device)
+        mask = mask.to(self.device)
 
         with torch.autocast(str(self.device), enabled=self.config.use_amp):
             output = self.model(inputs)
+            # 计算交叉熵损失（不使用ignore_index，因为我们手动应用mask）
             loss = self.criterion(
                 output.view(-1, self.config.model_args.vocab_size), targets.view(-1)
             )
+            # 应用mask：将mask展平并与损失相乘
+            loss = (loss * mask.view(-1)).sum() / mask.sum()
 
         loss = loss / self.config.batch_acceleration
 
@@ -429,7 +433,7 @@ class PreTrainer:
 
             torch.cuda.empty_cache()
 
-            for i, (train_inputs, train_targets) in enumerate(self.train_loader):
+            for i, (train_inputs, train_targets, train_mask) in enumerate(self.train_loader):
                 # 跳过已训练的step
                 if i <= self.start_step and epoch == self.start_epoch:
                     continue
@@ -437,7 +441,7 @@ class PreTrainer:
                 # if i == self.start_step + 1:
                 #     print(f"\r从断点恢复训练: {i}", end="")
                 self.current_step = i
-                loss = self._train_step(train_inputs, train_targets)
+                loss = self._train_step(train_inputs, train_targets, train_mask)
 
                 train_loss_sum += loss
                 self.train_loss_log.append((self.global_step, loss))
@@ -515,15 +519,18 @@ class PreTrainer:
         self.model.eval()
         val_loss_sum = 0
         with torch.no_grad():
-            for val_inputs, val_targets in self.val_loader:
+            for val_inputs, val_targets, val_mask in self.val_loader:
                 val_inputs = val_inputs.to(self.device)
                 val_targets = val_targets.to(self.device)
+                val_mask = val_mask.to(self.device)
                 with torch.autocast(str(self.device), enabled=self.config.use_amp):
                     val_output = self.model(val_inputs)
                     loss = self.criterion(
                         val_output.view(-1, self.config.model_args.vocab_size),
                         val_targets.view(-1),
                     )
+                    # 应用mask
+                    loss = (loss * val_mask.view(-1)).sum() / val_mask.sum()
                 val_loss_sum += loss.item()
         return val_loss_sum / len(self.val_loader)
 

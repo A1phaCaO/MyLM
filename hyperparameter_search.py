@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import logging
 
 from utils import model_structure, TextGenerator, WarmUpCosineLR, DebugTimer
-from dataset import StreamingTextDataset
+from dataset import PretrainTextDataset
 from models import MyLMArgs, MyLM
 
 # 配置日志
@@ -128,7 +128,7 @@ class HyperparameterSearcher:
         if downsample_rate is None:
             downsample_rate = self.config.dataset_downsample
             
-        dataset = StreamingTextDataset(
+        dataset = PretrainTextDataset(
             self.config.data_dir,
             downsample=downsample_rate,
             seq_max_len=self.config.seq_max_len,

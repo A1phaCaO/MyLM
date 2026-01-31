@@ -1,7 +1,7 @@
 {
     "d_model": 384,
     "d_inner": 768,
-    "n_layers": 3,
+    "n_layers": 2,
     "vocab_size": null,
     "seq_max_len": 200,
     "use_moe": false,
