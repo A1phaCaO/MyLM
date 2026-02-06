@@ -23,7 +23,8 @@ class TextGenerator:
             self.model = model
         self.seq_max_len = self.model.args.seq_max_len
         self.padding_side = padding_side
-        self.tokenizer.enable_padding(direction=padding_side, length=self.seq_max_len)
+        # 推理时应禁用padding,否则会干扰生成结果
+        # self.tokenizer.enable_padding(direction=padding_side, length=self.seq_max_len, pad_id=0, pad_token="<|endoftext|>")
         self.tokenizer.enable_truncation(
             max_length=self.seq_max_len, direction=padding_side
         )
@@ -269,7 +270,7 @@ class WarmUpStableDecayLR(torch.optim.lr_scheduler._LRScheduler):
                     # 线性衰减
                     progress = min(decay_steps / total_decay_steps, 1.0)
                     current_lr = base_lr + (self.min_lr - base_lr) * progress
-                
+
                 elif self.decay_mode == "exp":
                     # 指数衰减
                     if base_lr != 0 and self.min_lr >= 0 and base_lr > self.min_lr:
