@@ -10,43 +10,43 @@ import tokenizers
 
 
 # 导入模型文件
-model_dir = r"model\model_state.pth"
+model_dir = r"model\model_state_260206.pth"
 tokenizer_dir = r"bpe_tokenizer_6k_0724_ChatML.json"
-config_dir = r"model\config_0830.json"
+config_dir = r"model\config_260206.json"
 
 with open(config_dir, 'r', encoding='utf-8') as f:
     config = json.load(f)
 
 # 使用 tokenizers 库加载 tokenizer
 tokenizer = Tokenizer.from_file(tokenizer_dir)
-args = m.MyLMArgs(
-            d_model=256,
-            d_inner=int(((256 * (8 / 3)) // 64) * 64),
-            n_layers=1,
-            use_moe=False,
-            n_experts=None,
-            vocab_size=tokenizer.get_vocab_size(),
-            seq_max_len=192,
-            conv_bias=False,
-            ffn_bias=False,
-            attn_bias=False,
-            dropout=0.1,
-        )
 # args = m.MyLMArgs(
-#             d_model=config['d_model'],
-#             d_inner=config['d_inner'],
-#             n_layers=config['n_layers'],
-#             use_moe=config['use_moe'],
-#             n_experts=config['n_experts'],
-#             n_heads=config['n_heads'],
-#             d_head=config['d_head'],
+#             d_model=256,
+#             d_inner=int(((256 * (8 / 3)) // 64) * 64),
+#             n_layers=1,
+#             use_moe=False,
+#             n_experts=None,
 #             vocab_size=tokenizer.get_vocab_size(),
 #             seq_max_len=192,
 #             conv_bias=False,
 #             ffn_bias=False,
-#             attn_bias=True,
-#             dropout=0,
+#             attn_bias=False,
+#             dropout=0.1,
 #         )
+args = m.MyLMArgs(
+            d_model=config['d_model'],
+            d_inner=config['d_inner'],
+            n_layers=config['n_layers'],
+            use_moe=config['use_moe'],
+            n_experts=config['n_experts'],
+            n_heads=config['n_heads'],
+            d_head=config['d_head'],
+            vocab_size=tokenizer.get_vocab_size(),
+            seq_max_len=200,
+            conv_bias=False,
+            ffn_bias=False,
+            attn_bias=True,
+            dropout=0,
+        )
 print(config)
 model = m.MyLM(args).to('cuda')
 model_structure(model)

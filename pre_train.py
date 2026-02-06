@@ -60,7 +60,7 @@ class TrainingConfig:
     epochs: int = 1
     batch_size: int = 16
     batch_acceleration: int = 3
-    dataset_downsample: int = 0.1
+    dataset_downsample: int = 0.01
     valset_rate: float = 0.005
     val_interval_step: int = 800
     seq_max_len = 200
@@ -499,6 +499,7 @@ class PreTrainer:
                 f"{self.config.ckpt_save_dir.rsplit('.', 1)[0]}_epoch_{epoch}.pth",
                 is_final=True,
             )
+            
 
             # 每个epoch记录生成文本
             test_text = self.generate_test(gen_len=100)
