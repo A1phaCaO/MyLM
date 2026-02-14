@@ -1,3 +1,4 @@
+from re import A
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,6 +14,7 @@ class TextGenerator:
         device,
         padding_side="right",
     ) -> None:
+        assert padding_side in ["right", "left", "none"], "padding_side应为'right'或'left'或'none'"
         self.tokenizer = tokenizer
         self.device = device
         # self.padding_side = padding_side
@@ -23,12 +25,15 @@ class TextGenerator:
             self.model = model
         self.seq_max_len = self.model.args.seq_max_len
         self.padding_side = padding_side
-        # 推理时应禁用padding,否则会干扰生成结果
-        # self.tokenizer.enable_padding(direction=padding_side, length=self.seq_max_len, pad_id=0, pad_token="<|endoftext|>")
-        self.tokenizer.enable_truncation(
-            max_length=self.seq_max_len, direction=padding_side
-        )
-
+        if padding_side != "none":
+            self.tokenizer.enable_padding(direction=padding_side, length=self.seq_max_len, pad_id=0, pad_token="")
+            self.tokenizer.enable_truncation(
+                max_length=self.seq_max_len, direction=padding_side
+            )
+        elif padding_side == "none":
+            self.tokenizer.disable_padding()
+            self.tokenizer.disable_truncation()
+            
     def generate(
         self,
         start_token: str,
@@ -56,7 +61,7 @@ class TextGenerator:
                 # 根据padding方向选择logits位置
                 if self.padding_side == "right":
                     logits = out[0, len(tokens) - 1, :]
-                elif self.padding_side == "left":
+                elif self.padding_side == "left" or "none":
                     logits = out[0, -1, :]
                 else:
                     raise ValueError("padding_side must be 'right' or 'left'")

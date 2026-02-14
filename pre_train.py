@@ -53,14 +53,14 @@ class TrainingConfig:
     config_save_dir: str = r"config.json"
     log_dir: str = r"logs/" + time.strftime("%Y%m%d-%H%M%S")
     # log_dir: str = r"logs/20260102-143753"
-    padding_side = "left"
+    padding_side = "right"
 
     # 训练参数
     seed: int = 42
     epochs: int = 1
     batch_size: int = 16
     batch_acceleration: int = 3
-    dataset_downsample: int = 0.01
+    dataset_downsample: int = 0.05
     valset_rate: float = 0.005
     val_interval_step: int = 800
     seq_max_len = 200
@@ -73,9 +73,9 @@ class TrainingConfig:
     use_amp: bool = False
 
     model_args = MyLMArgs(
-        d_model=384,
-        d_inner=int(((384 * (6 / 3)) // 64) * 64),
-        d_head=96,
+        d_model=128,
+        d_inner=int(((128 * (8 / 3)) // 64) * 64),
+        d_head=64,
         n_heads=None,
         n_layers=2,
         vocab_size=None,
