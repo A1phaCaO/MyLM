@@ -31,9 +31,10 @@ class TextGenerator:
                 max_length=self.seq_max_len, direction=padding_side
             )
         elif padding_side == "none":
-            self.tokenizer.disable_padding()
-            self.tokenizer.disable_truncation()
-            
+            self.tokenizer.enable_truncation(
+                max_length=self.seq_max_len, direction="left"
+            )
+
     def generate(
         self,
         start_token: str,

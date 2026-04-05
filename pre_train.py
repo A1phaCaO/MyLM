@@ -46,8 +46,8 @@ class TrainingConfig:
     """训练配置参数"""
 
     # 数据配置
-    data_dir: str = r"mini_data200v2.txt"
-    tokenizer_dir: str = r"bpe_tokenizer_6k_0724_ChatML.json"
+    data_dir: str = r"mini_data200v3.txt"
+    tokenizer_dir: str = r"bpe_tokenizer_7k_260215.json"
     model_save_dir: str = r"model\model_state.pth"
     ckpt_save_dir: str = r"ckpt\ckpt.pth"
     config_save_dir: str = r"config.json"
@@ -58,26 +58,28 @@ class TrainingConfig:
     # 训练参数
     seed: int = 42
     epochs: int = 1
-    batch_size: int = 16
-    batch_acceleration: int = 3
-    dataset_downsample: int = 0.05
-    valset_rate: float = 0.005
-    val_interval_step: int = 800
+    batch_size: int = 32
+    batch_acceleration: int = 2
+    dataset_downsample: int = 0.71
+    valset_rate: float = 0.002
+    val_interval_step: int = 1600
     seq_max_len = 200
+    use_compile: bool = False
+    compile_mode: str = "default"
 
     # 优化参数
-    learning_rate: float = 5e-3
-    min_learning_rate: float = 5e-5  # WSD LRS衰减到1%
-    lr_decay_start_rate: int = 0.75  # 最后25%衰减
-    warmup_steps: int = 25
+    learning_rate: float = 6e-3
+    min_learning_rate: float = 6e-4  # WSD LRS衰减到1%
+    lr_decay_start_rate: int = 0.75  # 最后衰减
+    warmup_steps: int = 50
     use_amp: bool = False
 
     model_args = MyLMArgs(
-        d_model=128,
-        d_inner=int(((128 * (8 / 3)) // 64) * 64),
-        d_head=64,
+        d_model=256,
+        d_inner=int(((256 * (8 / 3)) // 64) * 64),
+        d_head=128,
         n_heads=None,
-        n_layers=2,
+        n_layers=4,
         vocab_size=None,
         seq_max_len=seq_max_len,
         use_moe=False,
@@ -103,14 +105,14 @@ class PreTrainer:
         self._set_seed()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer = tokenizers.Tokenizer.from_file(config.tokenizer_dir)
-        self.config.model_args.vocab_size = len(self.tokenizer.get_vocab())
+        self.config.model_args.vocab_size = int(len(self.tokenizer.get_vocab()))
         self.train_loader, self.val_loader = self._build_dataloader()
         self.model = self._build_model().to(self.device)
         self.criterion = nn.CrossEntropyLoss()
         self.optimizers, self.schedulers = self._build_optimizer()
         self.scaler = torch.GradScaler(self.device, enabled=config.use_amp)
         self.generator = TextGenerator(
-            self.model, self.tokenizer, self.device, padding_side=config.padding_side
+            self.model, self.tokenizer, self.device, padding_side="none"
         )
 
         # 用于扩展的属性
@@ -141,6 +143,10 @@ class PreTrainer:
     def _build_model(self):
         """构建模型"""
         model = MyLM(self.config.model_args)
+        if self.config.use_compile:
+            model = torch.compile(
+                model, mode=self.config.compile_mode, backend="eager"
+            )
         return model
 
     def _build_dataloader(self):
@@ -265,7 +271,7 @@ class PreTrainer:
                     - self.config.warmup_steps
                 ),
                 min_lr=self.config.min_learning_rate,
-                decay_mode="exp",
+                decay_mode="linear",
             )
             for optimizer in optimizers
         ]
@@ -393,7 +399,7 @@ class PreTrainer:
     def log(self):
         total_params = model_structure(self.model)
         print(f"本次训练参数：")
-        print(f"词数: {self.tokenizer.get_vocab_size()}")
+        print(f"词数: {self.config.model_args.vocab_size}")
         val_dataset_len, train_dataset_len = len(self.val_loader.dataset), len(
             self.train_loader.dataset
         )
@@ -433,7 +439,9 @@ class PreTrainer:
 
             torch.cuda.empty_cache()
 
-            for i, (train_inputs, train_targets, train_mask) in enumerate(self.train_loader):
+            for i, (train_inputs, train_targets, train_mask) in enumerate(
+                self.train_loader
+            ):
                 # 跳过已训练的step
                 if i <= self.start_step and epoch == self.start_epoch:
                     continue
@@ -446,7 +454,7 @@ class PreTrainer:
                 train_loss_sum += loss
                 self.train_loss_log.append((self.global_step, loss))
                 # 添加TensorBoard训练损失记录
-                writer.add_scalar("Loss/train", loss, self.global_step)
+                
                 # 记录学习率时添加step信息
                 # 由于有多个优化器，我们记录第一个优化器的学习率
                 self.lr_log.append(
@@ -459,7 +467,7 @@ class PreTrainer:
                     float(self.schedulers[0].get_last_lr()[0]),
                     self.global_step,
                 )
-
+                writer.add_scalar("Loss/train", loss, self.global_step)
                 # 验证阶段
                 if i % self.config.val_interval_step == 0:
                     val_loss = self.validate()
@@ -499,10 +507,9 @@ class PreTrainer:
                 f"{self.config.ckpt_save_dir.rsplit('.', 1)[0]}_epoch_{epoch}.pth",
                 is_final=True,
             )
-            
 
             # 每个epoch记录生成文本
-            test_text = self.generate_test(gen_len=100)
+            test_text = self.generate_test(gen_len=100, start="我是")
             writer.add_text(
                 "GeneratedText", f"epoch_{epoch}: {test_text}", self.global_step
             )

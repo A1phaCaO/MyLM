@@ -1,0 +1,20 @@
+# PyTorch GPT 项目 TODO 列表
+
+
+### 实验
+- [ ] 测试编译优化提速效果
+- [ ] 模型消融实验
+
+### 模型架构优化
+- [ ] 完善MoE（混合专家）架构实现，提速
+- [ ] 实现更多注意力机制变体（FlashAttention、LinearAttention等）
+- [ ] 添加模型并行化支持（Tensor Parallel, Pipeline Parallel）
+- [ ] 词表对齐现代模型
+
+### 代码开发
+- [ ] 完善监督微调(SFT)代码实现
+- [ ] 实现困惑度(perplexity)计算
+- [ ] 添加编译优化（torch.compile）
+- [ ] 实现动态批处理大小调整
+- [ ] PAD修复
+

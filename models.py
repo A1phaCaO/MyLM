@@ -182,143 +182,25 @@ class ALiBi(nn.Module):
 
 
 class Attention(nn.Module):
-    """带有sigmoid激活的LLaMA 注意力机制"""
+    """统一注意力机制，通过use_gate参数切换门控/标准模式"""
 
-    def __init__(self, args: MyLMArgs, base_init_std=0.02):
+    def __init__(self, args: MyLMArgs, use_gate=False, base_init_std=0.02):
         super().__init__()
         self.d_model = args.d_model
         self.n_heads = args.n_heads or (args.d_model // args.d_head)
         self.d_head = args.d_head
         self.seq_max_len = args.seq_max_len
-
-        # 注意力投影层
-        self.q_proj = nn.Linear(args.d_model, args.d_model)
-        self.k_proj = nn.Linear(args.d_model, args.d_model)
-        self.v_proj = nn.Linear(args.d_model, args.d_model)
-        self.o_proj = nn.Linear(args.d_model, args.d_model)
-
-        # RoPE位置编码缓存
-        self.register_buffer(
-            "cos_cached", torch.zeros(1, 1, args.seq_max_len, args.d_head)
-        )
-        self.register_buffer(
-            "sin_cached", torch.zeros(1, 1, args.seq_max_len, args.d_head)
-        )
-
-        self.attn_dropout = nn.Dropout(args.dropout)
-        self.resid_dropout = nn.Dropout(args.dropout)
-
-        # 初始化RoPE
-        self._init_rope()
-        self._reset_parameters(base_init_std=base_init_std)
-
-    def _reset_parameters(self, base_init_std=0.02):
-        # 初始化线性层权重
-        torch.nn.init.normal_(self.q_proj.weight, std=base_init_std)
-        torch.nn.init.normal_(self.k_proj.weight, std=base_init_std)
-        torch.nn.init.normal_(self.v_proj.weight, std=base_init_std)
-        torch.nn.init.normal_(self.o_proj.weight, std=base_init_std)
-
-    def _init_rope(self):
-        """初始化RoPE位置编码"""
-        d_head_half = self.d_head // 2
-        # 创建频率数组，长度为d_head_half
-        inv_freq = 1.0 / (
-            10000 ** (torch.arange(0, d_head_half, dtype=torch.float) / d_head_half)
-        )
-
-        t = torch.arange(self.seq_max_len, dtype=torch.float)
-        # 计算位置频率
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-
-        # 扩展到完整维度并添加批次和头数维度
-        emb = torch.cat((freqs, freqs), dim=-1)  # (seq_len, d_head)
-        # 使用register_buffer更新缓存，而不是直接赋值
-        self.register_buffer(
-            "cos_cached", emb.cos().unsqueeze(0).unsqueeze(0)
-        )  # (1, 1, seq_len, d_head)
-        self.register_buffer(
-            "sin_cached", emb.sin().unsqueeze(0).unsqueeze(0)
-        )  # (1, 1, seq_len, d_head)
-
-    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
-        """旋转一半维度"""
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
-    def _apply_rotary_pos_emb(
-        self, q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-    ):
-        """应用RoPE位置编码"""
-        # 调整cos和sin的维度以匹配q和k的序列长度
-        cos = cos[:, :, : q.size(2), :]  # (1, 1, seq_len, d_head)
-        sin = sin[:, :, : q.size(2), :]  # (1, 1, seq_len, d_head)
-
-        # 将q和k分割为两半用于旋转操作
-        q_embed = (q * cos) + (self._rotate_half(q) * sin)
-        k_embed = (k * cos) + (self._rotate_half(k) * sin)
-        return q_embed, k_embed
-
-    def forward(self, x: torch.Tensor, token_ids=None) -> torch.Tensor:
-        batch_size, seq_len, _ = x.size()
-
-        # 计算QKV
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-
-        # 重塑为多头形式
-        q = q.view(batch_size, seq_len, self.n_heads, self.d_head).transpose(
-            1, 2
-        )  # (batch, heads, seq, head_dim)
-        k = k.view(batch_size, seq_len, self.n_heads, self.d_head).transpose(
-            1, 2
-        )  # (batch, heads, seq, head_dim)
-        v = v.view(batch_size, seq_len, self.n_heads, self.d_head).transpose(
-            1, 2
-        )  # (batch, heads, seq, head_dim)
-
-        # 应用RoPE位置编码
-        cos = self.cos_cached[:, :, :seq_len, :]  # (1, 1, seq_len, d_head)
-        sin = self.sin_cached[:, :, :seq_len, :]  # (1, 1, seq_len, d_head)
-        q, k = self._apply_rotary_pos_emb(q, k, cos, sin)
-
-        # 计算注意力分数
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.d_head))
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=att.device)).view(
-            1, 1, seq_len, seq_len
-        )
-        att = att.masked_fill(causal_mask == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-
-        # 应用注意力权重
-        y = att @ F.sigmoid(v)  # (batch, heads, seq, head_dim)
-        y = (
-            y.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
-        )  # 重新组合多头
-        # 输出投影
-        y = self.resid_dropout(self.o_proj(y))
-        return y
-
-
-class GatedAttention(nn.Module):
-    """Qwen 门控注意力机制"""
-
-    def __init__(self, args: MyLMArgs, base_init_std=0.02):
-        super().__init__()
-        self.d_model = args.d_model
-        self.n_heads = args.n_heads or (args.d_model // args.d_head)
-        self.d_head = args.d_head
-        self.seq_max_len = args.seq_max_len
+        self.use_gate = use_gate
 
         # 注意力投影层
         self.q_proj = nn.Linear(args.d_model, args.d_model, bias=args.attn_bias)
         self.k_proj = nn.Linear(args.d_model, args.d_model, bias=args.attn_bias)
         self.v_proj = nn.Linear(args.d_model, args.d_model, bias=args.attn_bias)
         self.o_proj = nn.Linear(args.d_model, args.d_model, bias=args.attn_bias)
-        self.gate = nn.Linear(args.d_model, args.d_model, bias=False)
+        
+        # 门控层（仅在使用门控时创建）
+        if use_gate:
+            self.gate = nn.Linear(args.d_model, args.d_model, bias=False)
 
         # RoPE位置编码缓存
         self.register_buffer(
@@ -341,7 +223,9 @@ class GatedAttention(nn.Module):
         torch.nn.init.normal_(self.k_proj.weight, std=base_init_std)
         torch.nn.init.normal_(self.v_proj.weight, std=base_init_std)
         torch.nn.init.normal_(self.o_proj.weight, std=base_init_std)
-        torch.nn.init.normal_(self.gate.weight, std=base_init_std)
+        # 如果使用门控，初始化门控层
+        if self.use_gate and hasattr(self, 'gate'):
+            torch.nn.init.normal_(self.gate.weight, std=base_init_std)
 
     def _init_rope(self):
         """初始化RoPE位置编码"""
@@ -384,14 +268,17 @@ class GatedAttention(nn.Module):
         k_embed = (k * cos) + (self._rotate_half(k) * sin)
         return q_embed, k_embed
 
-    def forward(self, x: torch.Tensor, token_ids=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, token_ids=None, mask=None, causal=True) -> torch.Tensor:
         batch_size, seq_len, _ = x.size()
 
         # 计算QKV
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
-        gate = F.sigmoid(self.gate(x))
+        
+        # 计算门控（仅在使用门控时）
+        if self.use_gate:
+            gate = F.sigmoid(self.gate(x))
 
         # 重塑为多头形式
         q = q.view(batch_size, seq_len, self.n_heads, self.d_head).transpose(
@@ -411,19 +298,48 @@ class GatedAttention(nn.Module):
 
         # 计算注意力分数
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.d_head))
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=att.device)).view(
-            1, 1, seq_len, seq_len
-        )
-        att = att.masked_fill(causal_mask == 0, float("-inf"))
+        if causal:
+            # only causal
+            causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool)).view(
+                1, 1, seq_len, seq_len
+            )
+        else:
+            causal_mask = torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool).view(
+                1, 1, seq_len, seq_len
+            )
+
+        # 如果提供了外部mask，则将其与因果掩码合并
+        if mask is not None:
+            # 简单检查mask维度，不符合要求直接抛出异常
+            if mask.dim() != 4:
+                raise ValueError(f"Mask must be 4-dimensional, got {mask.dim()} dimensions")
+            if mask.shape != (batch_size, 1, seq_len, seq_len):
+                raise ValueError(f"Mask shape must be {(batch_size, 1, seq_len, seq_len)}, got {mask.shape}")
+            # 合并因果掩码和外部mask
+            combined_mask = causal_mask & mask
+        else:
+            # 只使用因果掩码
+            combined_mask = causal_mask
+        
+        att = att.masked_fill(combined_mask == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
 
         # 应用注意力权重
-        y = att @ v  # (batch, heads, seq, head_dim)
-        y = (
-            y.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
-        )  # 重新组合多头
-        y = y * gate
+        if self.use_gate:
+            # 门控注意力：不对V激活，而是在输出后应用门控
+            y = att @ v  # (batch, heads, seq, head_dim)
+            y = (
+                y.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+            )  # 重新组合多头
+            y = y * gate  # 应用门控
+        else:
+            # 标准注意力：对V应用sigmoid激活
+            y = att @ F.sigmoid(v)  # (batch, heads, seq, head_dim)
+            y = (
+                y.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+            )  # 重新组合多头
+        
         # 输出投影
         y = self.resid_dropout(self.o_proj(y))
         return y
@@ -514,10 +430,10 @@ class MyLMDecoderLayer(nn.Module):
     def __init__(self, args: MyLMArgs, layer_idx=0, base_init_std=0.02):
         super().__init__()
         self.args = args
-        self.attn = (
-            GatedAttention(args, base_init_std=base_init_std)
-            if layer_idx % 2 == 0
-            else Attention(args, base_init_std=base_init_std)
+        self.attn = Attention(
+            args, 
+            use_gate=(layer_idx % 2 == 0),  # 偶数层使用门控注意力，奇数层使用标准注意力
+            base_init_std=base_init_std
         )
         self.mlp = (
             MoEFFN(args) if args.use_moe else FFN(args, base_init_std=base_init_std)
@@ -529,7 +445,16 @@ class MyLMDecoderLayer(nn.Module):
         # 注意力部分
         residual = x
         x = self.input_layernorm(x)
-        x = self.attn(x, token_ids=token_ids)
+        seq_len = x.shape[1]  # 获取序列长度
+        # 创建padding mask，确保正确的4维形状 (batch_size, 1, seq_len, seq_len)
+        # 首先创建序列级别的mask
+        seq_mask = (x.sum(dim=-1) != 0)  # (batch_size, seq_len)
+        # 扩展为完整的注意力mask形状
+        pad_mask = seq_mask.unsqueeze(1).unsqueeze(2)  # (batch_size, 1, 1, seq_len)
+        # 扩展最后一个维度以匹配序列长度
+        pad_mask = pad_mask.expand(-1, -1, seq_len, -1)  # (batch_size, 1, seq_len, seq_len)
+        pad_mask = pad_mask.bool()  # 确保是bool类型
+        x = self.attn(x, token_ids=token_ids, mask=pad_mask)
         x = residual + x
 
         # MLP部分
