@@ -1,5 +1,4 @@
 import os
-
 # 设置环境变量以解决OpenMP库重复初始化问题
 os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 
@@ -57,10 +56,10 @@ class TrainingConfig:
 
     # 训练参数
     seed: int = 42
-    epochs: int = 1
+    epochs: int = 2
     batch_size: int = 32
     batch_acceleration: int = 2
-    dataset_downsample: int = 0.71
+    dataset_downsample: int = 0.08
     valset_rate: float = 0.002
     val_interval_step: int = 1600
     seq_max_len = 200
@@ -71,15 +70,15 @@ class TrainingConfig:
     learning_rate: float = 6e-3
     min_learning_rate: float = 6e-4  # WSD LRS衰减到1%
     lr_decay_start_rate: int = 0.75  # 最后衰减
-    warmup_steps: int = 50
+    warmup_steps: int = 10
     use_amp: bool = False
 
     model_args = MyLMArgs(
-        d_model=256,
-        d_inner=int(((256 * (8 / 3)) // 64) * 64),
-        d_head=128,
+        d_model=128,
+        d_inner=int(((128 * (8 / 3)) // 64) * 64),
+        d_head=64,
         n_heads=None,
-        n_layers=4,
+        n_layers=2,
         vocab_size=None,
         seq_max_len=seq_max_len,
         use_moe=False,
@@ -592,10 +591,10 @@ class PreTrainer:
 
 if __name__ == "__main__":
     config = TrainingConfig()
+    trainer = PreTrainer(config)
     config_dict = asdict(config.model_args)
     with open(config.config_save_dir, "w") as f:
         json.dump(config_dict, f, indent=4)
-    trainer = PreTrainer(config)
     trainer.log()
     trainer.train()
     trainer.plot_losses()
