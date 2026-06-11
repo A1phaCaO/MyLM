@@ -1,0 +1,22 @@
+{
+    "d_model": 128,
+    "d_inner": 320,
+    "n_layers": 2,
+    "vocab_size": 7186,
+    "seq_max_len": 200,
+    "use_moe": false,
+    "n_heads": null,
+    "n_experts": null,
+    "n_experts_per_tok": null,
+    "d_conv": null,
+    "conv_bias": null,
+    "ffn_bias": false,
+    "attn_bias": true,
+    "d_head": 64,
+    "dropout": 0.05,
+    "base_init_std": 0.02,
+    "resid_pdrop": 0.1,
+    "resid_scale": 1.0,
+    "layer_scale": 1.0,
+    "use_deepnet_scaling": true
+}

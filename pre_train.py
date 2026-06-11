@@ -18,6 +18,7 @@ from tqdm import tqdm
 import random
 import gc
 import json
+import math
 import time
 
 from dataclasses import dataclass, asdict
@@ -55,20 +56,20 @@ class TrainingConfig:
     padding_side = "right"
 
     # 训练参数
-    seed: int = 42
+    seed: int = 37
     epochs: int = 2
     batch_size: int = 32
     batch_acceleration: int = 2
-    dataset_downsample: int = 0.08
-    valset_rate: float = 0.002
-    val_interval_step: int = 1600
+    dataset_downsample: int = 0.15
+    valset_rate: float = 0.001
+    val_interval_step: int = 1400
     seq_max_len = 200
     use_compile: bool = False
     compile_mode: str = "default"
 
     # 优化参数
-    learning_rate: float = 6e-3
-    min_learning_rate: float = 6e-4  # WSD LRS衰减到1%
+    learning_rate: float = 5e-3
+    min_learning_rate: float = 5e-4  # WSD LRS衰减到1%
     lr_decay_start_rate: int = 0.75  # 最后衰减
     warmup_steps: int = 10
     use_amp: bool = False
@@ -88,7 +89,7 @@ class TrainingConfig:
         conv_bias=None,
         ffn_bias=False,
         attn_bias=True,
-        dropout=0.1,
+        dropout=0.05,
     )
 
     # 新增参数：checkpoint保存间隔步数
@@ -469,7 +470,7 @@ class PreTrainer:
                 writer.add_scalar("Loss/train", loss, self.global_step)
                 # 验证阶段
                 if i % self.config.val_interval_step == 0:
-                    val_loss = self.validate()
+                    val_loss, val_ppl = self.validate()
                     # 文本生成测试
                     test_text = self.generate_test("人工智能是")
                     writer.add_text(
@@ -480,15 +481,17 @@ class PreTrainer:
                     self.val_loss_log.append((self.global_step, val_loss))
                     # 添加TensorBoard验证损失记录
                     writer.add_scalar("Loss/val", val_loss, self.global_step)
+                    print(f"Test - Loss: {val_loss:.4f}, PPL: {val_ppl:.4f}")
 
                 # 进度显示
                 bar.update(1)
-                bar.postfix = f"train_loss: {loss:.2f} test_loss: {val_loss:.2f} lr: {self.schedulers[0].get_last_lr()[0]:.2e}"
+                bar.postfix = f"train_loss: {loss:.2f} lr: {self.schedulers[0].get_last_lr()[0]:.2e}"
 
                 # 每n步直接保存checkpoint
                 if self.global_step % self.config.ckpt_interval_step == 0:
-                    val_loss = self.validate()
+                    val_loss, val_ppl = self.validate()
                     self.val_loss_log.append((self.global_step, val_loss))
+                    print(f"Checkpoint - Loss: {val_loss:.4f}, PPL: {val_ppl:.4f}")
                     # 生成带步数的checkpoint路径
                     ckpt_path = f"{self.config.ckpt_save_dir.rsplit('.', 1)[0]}_epoch_{self.current_epoch}_step_{self.global_step}.pth"
                     self.save_checkpoint(ckpt_path, is_final=False)
@@ -496,7 +499,7 @@ class PreTrainer:
             bar.close()
 
             # 周期性验证
-            val_loss = self.validate()
+            val_loss, val_ppl = self.validate()
             self.val_loss_log.append((self.global_step, val_loss))
 
             # 文本生成测试
@@ -512,6 +515,7 @@ class PreTrainer:
             writer.add_text(
                 "GeneratedText", f"epoch_{epoch}: {test_text}", self.global_step
             )
+            print(f"Test - Loss: {val_loss:.4f}, PPL: {val_ppl:.4f}")
             print(f"学习率{self.schedulers[0].get_last_lr()}")
 
             print(
@@ -521,8 +525,8 @@ class PreTrainer:
         # 保存最终模型
         self.save_checkpoint(self.config.model_save_dir, is_final=True)
 
-    def validate(self) -> float:
-        """验证过程"""
+    def validate(self):
+        """验证过程，返回 (平均loss, ppl)"""
         self.model.eval()
         val_loss_sum = 0
         with torch.no_grad():
@@ -536,10 +540,11 @@ class PreTrainer:
                         val_output.view(-1, self.config.model_args.vocab_size),
                         val_targets.view(-1),
                     )
-                    # 应用mask
                     loss = (loss * val_mask.view(-1)).sum() / val_mask.sum()
                 val_loss_sum += loss.item()
-        return val_loss_sum / len(self.val_loader)
+        avg_loss = val_loss_sum / len(self.val_loader)
+        ppl = math.exp(avg_loss)
+        return avg_loss, ppl
 
     def generate_test(self, start: str = "我", gen_len: int = 25):
         """文本生成测试（修改为返回文本）"""
