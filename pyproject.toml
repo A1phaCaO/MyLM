@@ -3,18 +3,26 @@ name = "pytorch-gpt"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 dependencies = [
     "matplotlib>=3.10.9",
+    "pandas>=3.0.3",
+    "pyarrow>=24.0.0",
     "pyparsing>=3.3.2",
+    "sentencepiece>=0.2.2",
     "tensorboard>=2.20.0",
     "tokenizers>=0.23.1",
     "torch==2.11.0+cu130",
     "tqdm>=4.66.5",
 ]
 
+[tool.uv.sources]
+torch = { index = "pytorch" }
+# 如果你的项目还依赖 torchvision 和 torchaudio，建议一并加上：
+# torchvision = { index = "pytorch" }
+# torchaudio = { index = "pytorch" }
+
+# 2. 定义 "pytorch" 索引的具体地址 (这里以 cu130 为例)
 [[tool.uv.index]]
-url = "https://mirrors.aliyun.com/pypi/simple/"
-default = true
-[[tool.uv.index]]
+name = "pytorch"
 url = "https://download.pytorch.org/whl/cu130"

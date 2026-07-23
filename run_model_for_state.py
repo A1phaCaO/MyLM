@@ -10,9 +10,9 @@ import tokenizers
 
 
 # 导入模型文件
-model_dir = r"model\model_state_260206.pth"
+model_dir = r"model\model_state.pth"
 tokenizer_dir = r"bpe_tokenizer_6k_0724_ChatML.json"
-config_dir = r"model\config_260206.json"
+config_dir = r"config.json"
 
 with open(config_dir, 'r', encoding='utf-8') as f:
     config = json.load(f)

@@ -44,7 +44,7 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x):
         input_dtype = x.dtype
-        x = x.to(torch.float32)
+        x = x.to(torch.bfloat16)
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * x.to(input_dtype)

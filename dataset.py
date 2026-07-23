@@ -163,6 +163,7 @@ class RuntimeTextDatasetV4(torch.utils.data.Dataset):
 
         Args:
             data_dir (str): 数据目录的路径。
+            seq_max_len (int): 序列的最大长度。
             vocab_size (int): 词汇表的大小。
             downsample (int): 数据下采样率，控制是否对数据进行下采样。
             batch (bool): 是否使用batch流程，速度提升但无进度条

@@ -46,7 +46,7 @@ class TrainingConfig:
     """训练配置参数"""
 
     # 数据配置
-    data_dir: str = r"mini_data200v3.txt"
+    data_dir: str = r"mini_data192hq.txt"
     tokenizer_dir: str = r"bpe_tokenizer_7k_260215.json"
     model_save_dir: str = r"model\model_state.pth"
     ckpt_save_dir: str = r"ckpt\ckpt.pth"
@@ -56,30 +56,30 @@ class TrainingConfig:
     padding_side = "right"
 
     # 训练参数
-    seed: int = 37
-    epochs: int = 2
-    batch_size: int = 32
-    batch_acceleration: int = 2
-    dataset_downsample: int = 0.15
+    seed: int = 42
+    epochs: int = 1
+    batch_size: int = 128
+    batch_acceleration: int = 3
+    dataset_downsample: int = 1
     valset_rate: float = 0.001
-    val_interval_step: int = 1400
+    val_interval_step: int = 700
     seq_max_len = 200
-    use_compile: bool = False
-    compile_mode: str = "default"
+    use_compile: bool = True
+    compile_mode: str = "max-autotune"  # "max-autotune" or "default" or "reduce-overhead"
 
     # 优化参数
-    learning_rate: float = 5e-3
-    min_learning_rate: float = 5e-4  # WSD LRS衰减到1%
+    learning_rate: float = 6e-3
+    min_learning_rate: float = 6e-4  # WSD LRS衰减到1%
     lr_decay_start_rate: int = 0.75  # 最后衰减
     warmup_steps: int = 10
-    use_amp: bool = False
+    use_amp: bool = True
 
     model_args = MyLMArgs(
-        d_model=128,
-        d_inner=int(((128 * (8 / 3)) // 64) * 64),
-        d_head=64,
+        d_model=256,
+        d_inner=int(((256 * (8 / 3)) // 64) * 64),
+        d_head=128,
         n_heads=None,
-        n_layers=2,
+        n_layers=4,
         vocab_size=None,
         seq_max_len=seq_max_len,
         use_moe=False,
@@ -89,7 +89,7 @@ class TrainingConfig:
         conv_bias=None,
         ffn_bias=False,
         attn_bias=True,
-        dropout=0.05,
+        dropout=0.1,
     )
 
     # 新增参数：checkpoint保存间隔步数
@@ -171,14 +171,14 @@ class PreTrainer:
             batch_size=self.config.batch_size,
             shuffle=True,
             pin_memory=True,
-            num_workers=4,
+            num_workers=6,
         )
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
             pin_memory=True,
-            num_workers=1,
+            num_workers=4,
         )
 
         return train_loader, val_loader
@@ -362,7 +362,7 @@ class PreTrainer:
         targets = targets.to(self.device)
         mask = mask.to(self.device)
 
-        with torch.autocast(str(self.device), enabled=self.config.use_amp):
+        with torch.autocast(str(self.device), enabled=self.config.use_amp, dtype=torch.bfloat16):
             output = self.model(inputs)
             # 计算交叉熵损失（不使用ignore_index，因为我们手动应用mask）
             loss = self.criterion(

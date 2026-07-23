@@ -23,9 +23,9 @@ def extract_content_from_jsonl(file_path, field_name='content'):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='从JSONL文件中提取指定字段内容')
-    parser.add_argument('--input', default=r"train_text\distill_r1_110k_sft-.jsonl", help='输入的JSONL文件路径')
-    parser.add_argument('--output', default=r"Train_text\processed_text.jsonl", help='输出文本文件路径')
-    parser.add_argument('--field', default='instruction', help='要提取的字段名称（默认：content）')
+    parser.add_argument('input', help='输入的JSONL文件路径')
+    parser.add_argument('--output', default=r"data_process\processed_text.txt", help='输出文本文件路径')
+    parser.add_argument('--field', default='content', help='要提取的字段名称（默认：content）')
     
     args = parser.parse_args()
 
