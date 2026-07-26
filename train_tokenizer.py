@@ -55,6 +55,7 @@ trainer = trainers.BpeTrainer(
     special_tokens=SPECIAL_TOKENS,
     initial_alphabet=initial_alphabet,
     vocab_size=7168,
+    limit_alphabet=65535,
     min_frequency=2,
     show_progress=True,
 )

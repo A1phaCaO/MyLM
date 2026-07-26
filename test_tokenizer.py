@@ -48,8 +48,10 @@ def count_unknown_words(text: str, tokenizer: Tokenizer) -> Tuple[Dict[str, int]
 
 
 if __name__ == "__main__":
-    tokenizer: Tokenizer = Tokenizer.from_file("bpe_tokenizer_7k_260215.json")
-    text = r"<|endoftext|><|im_start|>system\n你是一个乐于助人的AI助手，用中文进行对话。<|im_end|>\n<|im_start|>user\n你好，今天天气怎么样？<|im_end|>\n<|im_start|>assistant\n你好！我无法获取实时天气信息，建议你查看当地的天气预报应用或网站哦。<|im_end|>\n<|im_start|>user\n你能帮我写一首关于秋天的诗吗？<|im_end|>\n<|im_start|>assistant\n当然可以，这是一首为你写的秋日小诗：\n\n秋风轻拂叶飘黄，\n霜染层林映晚阳。\n稻浪翻金农事乐，\n雁行南去字成行。\n\n希望你喜欢！hello i am a helpful assistant apples are good for our health<|im_end|>"
+    tokenizer: Tokenizer = Tokenizer.from_file(
+        "bbpe_tokenizer_7k_260723_exp.json")
+    text = r"<|endoftext|><|im_start|>system\n你是一个乐于助人的AI助手，用中文进行对话。<|im_end|>\n<|im_start|>user\n你好，今天天气怎么样？<|im_end|>\n<|im_start|>assistant\n你好！我无法获取实时天气信息，建议你查看当地的天气预报应用或网站哦。<|im_end|>\n<|im_start|>user\n你能帮我写一首关于秋天的诗吗？<|im_end|>\n<|im_start|>assistant\n当然可以，这是一首为你写的秋日小诗：\n\n秋风轻拂叶飘黄，\n霜染层林映晚阳。\n稻浪翻金农事乐，\n雁行南去字成行。\n\n希望你喜欢！hello i am a helpful assistant apples are good for our health<|im_end|>时代被苦难与热血层层推进，在这艰辛而冗长的洪流中，有人身陷激流，口鼻灌水却奋力托举；有人探出水面，声音嘶哑却依旧歌唱；有人寻声而至奋力挣扎，浑身浴血，终于立足岸边。他们托举、前进、站起，自血肉之躯中爆发怒吼，唱响时代之音。"
+    # text = ' '
     encoding = tokenizer.encode(text)
 
     # 获取token字符串（调试用）

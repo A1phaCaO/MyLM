@@ -35,7 +35,7 @@ from utils import (
     WarmUpStableDecayLR,
     DebugTimer,
 )
-from dataset import TextDatasetV4, RuntimeTextDatasetV4, PretrainTextDataset
+from dataset import TextDatasetV4, RuntimeTextDatasetV4, PretrainTextDataset, PretrainTokenIDDataset
 from models import MyLMArgs, MyLM
 
 t = DebugTimer()
@@ -46,11 +46,11 @@ class TrainingConfig:
     """训练配置参数"""
 
     # 数据配置
-    data_dir: str = r"mini_data192hq.txt"
-    tokenizer_dir: str = r"bpe_tokenizer_7k_260215.json"
-    model_save_dir: str = r"model\model_state.pth"
+    data_dir: str = r"medium_data384.npy"
+    tokenizer_dir: str = r"bbpe_tokenizer_7k_260723_xl.json"
+    model_save_dir: str = r"model\model_state_l.pth"
     ckpt_save_dir: str = r"ckpt\ckpt.pth"
-    config_save_dir: str = r"config.json"
+    config_save_dir: str = r"model\config.json"
     log_dir: str = r"logs/" + time.strftime("%Y%m%d-%H%M%S")
     # log_dir: str = r"logs/20260102-143753"
     padding_side = "right"
@@ -59,11 +59,11 @@ class TrainingConfig:
     seed: int = 42
     epochs: int = 1
     batch_size: int = 128
-    batch_acceleration: int = 3
-    dataset_downsample: int = 1
+    batch_acceleration: int = 2
+    dataset_downsample: int = 0.5
     valset_rate: float = 0.001
-    val_interval_step: int = 700
-    seq_max_len = 200
+    val_interval_step: int = 800
+    seq_max_len = 384
     use_compile: bool = True
     compile_mode: str = "max-autotune"  # "max-autotune" or "default" or "reduce-overhead"
 
@@ -71,15 +71,15 @@ class TrainingConfig:
     learning_rate: float = 6e-3
     min_learning_rate: float = 6e-4  # WSD LRS衰减到1%
     lr_decay_start_rate: int = 0.75  # 最后衰减
-    warmup_steps: int = 10
+    warmup_steps: int = 20
     use_amp: bool = True
 
     model_args = MyLMArgs(
-        d_model=256,
-        d_inner=int(((256 * (8 / 3)) // 64) * 64),
+        d_model=384,
+        d_inner=int(((384 * (8 / 3)) // 64) * 64),
         d_head=128,
         n_heads=None,
-        n_layers=4,
+        n_layers=6,
         vocab_size=None,
         seq_max_len=seq_max_len,
         use_moe=False,
@@ -151,14 +151,12 @@ class PreTrainer:
 
     def _build_dataloader(self):
         """构建数据加载器"""
-        dataset = PretrainTextDataset(
+        dataset = PretrainTokenIDDataset(
             self.config.data_dir,
-            downsample=self.config.dataset_downsample,
             seq_max_len=self.config.seq_max_len,
-            tokenizer=self.tokenizer,
-            re_tokenize=False,
-            batch=False,
+            downsample=self.config.dataset_downsample,
             padding_side=self.config.padding_side,
+            # dtype 默认 uint16，与 generate_dataset_v3 一致；若 v3 改 int32 这里也改
         )
         val_dataset_len = int(len(dataset) * self.config.valset_rate)
         train_dataset_len = len(dataset) - val_dataset_len

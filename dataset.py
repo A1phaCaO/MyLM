@@ -6,6 +6,7 @@ import tokenizers
 import json
 import sys
 import random
+import numpy as np
 
 # import tracemalloc
 
@@ -143,6 +144,102 @@ class PretrainTextDataset(torch.utils.data.Dataset):
 
         # 生成loss mask（对应output位置）
         mask = self._create_loss_mask(outputs.cpu().tolist())
+        mask_tensor = torch.tensor(mask, dtype=torch.float32)
+
+        return (inputs, outputs, mask_tensor)
+
+
+class PretrainTokenIDDataset(torch.utils.data.Dataset):
+    """
+    二进制 token ID 数据集（配合 generate_dataset_v3.py 产物）。
+    直接从 .npy (2D uint16, shape=(N, SENTENCE_MAXLEN)) 加载，mmap 流式访问。
+    无需 tokenizer，__getitem__ 不做任何编码。
+    返回格式：(input, output, mask)，mask 基于 pad_value=0。
+
+    约定：存储长度 = seq_max_len + 1（因 __getitem__ 做 [:-1]/[1:] 切片）。
+    若存储长度 > seq_max_len + 1，truncate；若 < seq_max_len + 1，pad。
+    推荐：生成时 SENTENCE_MAXLEN = 训练 seq_max_len + 1，loader 无需 pad。
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        seq_max_len: int = 192,
+        downsample: int = 1,
+        padding_side: str = "right",
+        pad_value: int = 0,
+        dtype=np.uint16,
+    ):
+        super().__init__()
+        self.data_dir = data_dir
+        self.seq_max_len = seq_max_len
+        self.padding_side = padding_side
+        self.pad_value = pad_value
+        self.dtype = dtype
+        # mmap 流式加载：不会一次性把整个文件读进内存
+        self.data = np.load(data_dir, mmap_mode="r")
+        self.n_samples = self.data.shape[0]
+        self.storage_len = self.data.shape[1]   # SENTENCE_MAXLEN，通常 = seq_max_len + 1
+        # 下采样：随机抽取索引（与 PretrainTextDataset 行为对齐）
+        if downsample != 1:
+            k = int(self.n_samples * downsample)
+            self.indices = random.sample(range(self.n_samples), k)
+        else:
+            self.indices = list(range(self.n_samples))
+
+    def pad_seq(
+        self,
+        seq: np.ndarray,
+        max_len: int,
+        padding_value: int = 0,
+        padding_side: str = "right",
+    ) -> np.ndarray:
+        """对序列进行截断+填充（与 PretrainTextDataset.pad_seq 逻辑一致）"""
+        if padding_side == "right":
+            seq = seq[:max_len]
+            if len(seq) < max_len:
+                seq = np.concatenate(
+                    [seq, np.full(max_len - len(seq), padding_value, dtype=seq.dtype)]
+                )
+        elif padding_side == "left":
+            seq = seq[-max_len:]
+            if len(seq) < max_len:
+                seq = np.concatenate(
+                    [np.full(max_len - len(seq), padding_value, dtype=seq.dtype), seq]
+                )
+        else:
+            raise ValueError("padding_side must be 'left' or 'right'")
+        return seq
+
+    def _create_loss_mask(self, padded_seq, padding_value: int = 0) -> list[int]:
+        """生成 loss mask：有效位置为 1，padding 位置为 0"""
+        return [0 if int(t) == padding_value else 1 for t in padded_seq]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        """
+        根据索引获取数据样本，只在需要时读取对应行（mmap）
+        返回格式：(input, output, mask)
+        """
+        # 从 mmap 拷出一行（转为本机 dtype）
+        row = np.array(self.data[self.indices[index]], dtype=self.dtype)
+        # 截断/填充到 seq_max_len + 1（因为后续 [:-1]/[1:] 切片会少 1）
+        target_len = self.seq_max_len + 1
+        raw = self.pad_seq(
+            row,
+            max_len=target_len,
+            padding_value=self.pad_value,
+            padding_side=self.padding_side,
+        )
+        raw_tensor = torch.tensor(raw, dtype=torch.long)
+
+        inputs = raw_tensor[:-1].contiguous()   # length = seq_max_len
+        outputs = raw_tensor[1:].contiguous()    # length = seq_max_len
+
+        # 生成 loss mask（对应 output 位置）
+        mask = self._create_loss_mask(outputs.cpu().tolist(), padding_value=self.pad_value)
         mask_tensor = torch.tensor(mask, dtype=torch.float32)
 
         return (inputs, outputs, mask_tensor)
