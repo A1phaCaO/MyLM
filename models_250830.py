@@ -10,6 +10,7 @@ import math
 class MyLMArgs:
     d_model: int
     d_inner: int
+    n_heads: int
     n_layers: int
     vocab_size: int
     seq_max_len: int
@@ -20,6 +21,7 @@ class MyLMArgs:
     conv_bias: bool = True
     ffn_bias: bool = False
     attn_bias: bool = False
+    d_head: int = 64
     dropout: float = 0.1
 
 
@@ -36,6 +38,57 @@ class RMSNorm(torch.nn.Module):
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * x.to(input_dtype)
 
+
+class CausalConv1d(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        dilation=1,
+        groups=1,
+        bias=True,
+    ):
+        super(CausalConv1d, self).__init__()
+        self.pad = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=self.pad,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+
+    def forward(self, input):
+        return self.conv(input)[:, :, : -self.pad]
+
+
+class GPT2PositionEmbedding(nn.Module):
+    def __init__(self, seq_max_len, d_model):
+        super().__init__()
+        self.pos_emb = nn.Embedding(seq_max_len, d_model // 8)
+        self.up_proj = nn.Linear(d_model // 8, d_model, bias=False)
+
+    def _reset_parameters(self):
+        nn.init.normal_(self.pos_emb.weight, std=0.01)
+        nn.init.normal_(self.up_proj.weight, std=0.01)
+
+    def forward(self, x):
+        batch_size, seq_len, d_model = x.shape
+
+        assert (
+            seq_len <= self.pos_emb.num_embeddings
+        ), f"序列长度 {seq_len} 超过预设最大值 {self.pos_emb.num_embeddings}"  # 检查序列长度是否超限
+        # 生成位置编码并相加
+        pos = torch.arange(seq_len).to(x.device)  # (seq_len,)
+        pos_emb = self.pos_emb(pos)  # (seq_len, d_model)
+        pos_emb = self.up_proj(pos_emb)
+        pos_emb = pos_emb.unsqueeze(0)  # (1, seq_len, d_model)
+        return x + pos_emb  # 广播到 (batch_size, seq_len, d_model)
 
 
 class MyPositionEmbedding(nn.Module):
@@ -121,7 +174,7 @@ class ALiBi(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, embed_dim, num_heads, vocab_size=None, dropout=0, bias=True):
+    def __init__(self, embed_dim, head_dim, num_heads, vocab_size=None, dropout=0, bias=True):
         """
         Args:
             embed_dim: 模型的总维度
@@ -131,8 +184,13 @@ class Attention(nn.Module):
         """
         super().__init__()
         self.embed_dim = embed_dim
+        if head_dim is None:
+            head_dim = 64
+        if num_heads is None:
+            num_heads = embed_dim // head_dim
+        
         self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.head_dim = head_dim
         assert self.head_dim * num_heads == embed_dim, "embed_dim必须能被num_heads整除"
 
         # 线性变换矩阵
@@ -212,7 +270,7 @@ class Attention(nn.Module):
         # v = self.v_proj(x)
         q = self.q_pos(x)
         k = self.k_pos(x)
-        v = F.tanh(x) * self.v_emb(token_ids).permute(1, 0, 2)
+        v = F.silu(x) * self.v_emb(token_ids).permute(1, 0, 2)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -377,7 +435,8 @@ class MyLMDecoderLayer(nn.Module):
         # self.alibi = ALiBi(args.d_model // 64)
         self.mha: Attention = Attention(
             args.d_model,
-            args.d_model // 64,
+            args.d_head,
+            args.n_heads,
             dropout=args.dropout,
             bias=args.attn_bias,
             vocab_size=args.vocab_size,
@@ -470,6 +529,7 @@ if __name__ == "__main__":
         d_model=512,
         d_inner=2048,
         n_layers=8,
+        n_heads=512//64,
         vocab_size=10000,
         seq_max_len=512,
         use_moe=False,

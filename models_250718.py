@@ -37,6 +37,57 @@ class RMSNorm(torch.nn.Module):
         return self.weight * x.to(input_dtype)
 
 
+class CausalConv1d(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride=1,
+        dilation=1,
+        groups=1,
+        bias=True,
+    ):
+        super(CausalConv1d, self).__init__()
+        self.pad = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=self.pad,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+
+    def forward(self, input):
+        return self.conv(input)[:, :, : -self.pad]
+
+
+class GPT2PositionEmbedding(nn.Module):
+    def __init__(self, seq_max_len, d_model):
+        super().__init__()
+        self.pos_emb = nn.Embedding(seq_max_len, d_model // 8)
+        self.up_proj = nn.Linear(d_model // 8, d_model, bias=False)
+
+    def _reset_parameters(self):
+        nn.init.normal_(self.pos_emb.weight, std=0.01)
+        nn.init.normal_(self.up_proj.weight, std=0.01)
+
+    def forward(self, x):
+        batch_size, seq_len, d_model = x.shape
+
+        assert (
+            seq_len <= self.pos_emb.num_embeddings
+        ), f"序列长度 {seq_len} 超过预设最大值 {self.pos_emb.num_embeddings}"  # 检查序列长度是否超限
+        # 生成位置编码并相加
+        pos = torch.arange(seq_len).to(x.device)  # (seq_len,)
+        pos_emb = self.pos_emb(pos)  # (seq_len, d_model)
+        pos_emb = self.up_proj(pos_emb)
+        pos_emb = pos_emb.unsqueeze(0)  # (1, seq_len, d_model)
+        return x + pos_emb  # 广播到 (batch_size, seq_len, d_model)
+
 
 class MyPositionEmbedding(nn.Module):
     def __init__(self, d_model, d_out, d_inner=None):
