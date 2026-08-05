@@ -11,6 +11,8 @@ class MyLMArgs:
     d_model: int
     d_inner: int
     n_layers: int
+    latent_moe: int
+    d_latent: int
     vocab_size: int
     seq_max_len: int
     use_moe: bool = False
@@ -350,9 +352,11 @@ class FFN(nn.Module):
     def __init__(self, args: MyLMArgs, base_init_std=0.02):
         super().__init__()
         self.args = args
-        self.gate_proj = nn.Linear(args.d_model, args.d_inner, bias=False)
-        self.up_proj = nn.Linear(args.d_model, args.d_inner, bias=False)
-        self.down_proj = nn.Linear(args.d_inner, args.d_model, bias=False)
+        # 用局部变量而非改写共享 args，避免副作用污染 args.d_latent
+        d_in = args.d_latent if args.latent_moe else args.d_model
+        self.gate_proj = nn.Linear(d_in, args.d_inner, bias=False)
+        self.up_proj = nn.Linear(d_in, args.d_inner, bias=False)
+        self.down_proj = nn.Linear(args.d_inner, d_in, bias=False)
         self._reset_parameters(base_init_std=base_init_std)
 
     def _reset_parameters(self, base_init_std=0.02):
@@ -369,55 +373,87 @@ class FFN(nn.Module):
 
 
 class MoEFFN(nn.Module):
-    def __init__(self, args: MyLMArgs):
+    def __init__(self, args: MyLMArgs, base_init_std=0.02):
         """
         激活参数量为 n_experts_per_token * ffn
         总参数量为 n_experts * ffn
         """
         super().__init__()
         self.args = args
-        self.router = nn.Linear(args.d_model, args.n_experts)
+        if args.latent_moe:
+            self.latent_down = nn.Linear(args.d_model, args.d_latent, bias=False)
+            self.latent_up = nn.Linear(args.d_latent, args.d_model, bias=False)
+
+        self.router = nn.Linear(args.d_model, args.n_experts, bias=False)
         self.experts = nn.ModuleList([FFN(args) for _ in range(args.n_experts)])
+        self._reset_parameters(base_init_std)
 
     def _reset_parameters(self, base_init_std=0.02):
         # 路由器使用较小的标准差，避免初始化时偏向特定专家
-        torch.nn.init.normal_(self.router.weight, std=base_init_std * 0.1)
+        torch.nn.init.normal_(self.router.weight, std=base_init_std*0.5)
         if self.router.bias is not None:
             nn.init.zeros_(self.router.bias)
+        # latent 投影与专家保持一致的初始化分布
+        if self.args.latent_moe:
+            torch.nn.init.normal_(self.latent_down.weight, std=base_init_std)
+            torch.nn.init.normal_(self.latent_up.weight, std=base_init_std)
         # 初始化所有专家
         for expert in self.experts:
             expert._reset_parameters(base_init_std)
 
     def forward(self, x, token_ids=None):
-        # 路由块
-        probs = F.softmax(self.router(x), dim=-1)
-        top_k_probs, top_k_indices = torch.topk(
-            probs, self.args.n_experts_per_tok, dim=-1
+        # 路由块：sqrt(softplus(.)) 单调，直接对 router logits 做 topk，
+        # 省去对全量 [B,S,n_experts] 的 softplus+sqrt
+        router_logits = self.router(x)  # [B, S, n_experts]
+        top_k_logits, top_k_indices = torch.topk(
+            router_logits, self.args.n_experts_per_tok, dim=-1
         )
-        # 归一化概率
+        # 对 topk logits 做 sqrt(softplus) 再归一化
+        top_k_probs = torch.sqrt(F.softplus(top_k_logits))
         top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
 
-        # 专家块
-        expert_inputs = x.view(
-            -1, x.shape[-1]
-        )  # 展平出所有token [batch_size*seq_len, hidden_size]
-        expert_inputs = expert_inputs.repeat_interleave(
-            self.args.n_experts_per_tok, dim=0
-        )
-        flat_top_k_idx = top_k_indices.view(-1)  # 展平出所有token对应的专家索引
-        expert_outputs = torch.zeros_like(expert_inputs)  # 分配专家输出
+        # Latent 投影
+        if self.args.latent_moe:
+            x = self.latent_down(x)
 
-        # 遍历所有专家 处理对应token
+        # 专家块：argsort 一次分桶，避免每个 expert 调用 nonzero 同步
+        K = self.args.n_experts_per_tok
+        N = self.args.n_experts
+        flat_x = x.view(-1, x.shape[-1])  # [B*S, H]，仅 view 不复制
+        flat_top_k_idx = top_k_indices.view(-1)  # [B*S*K]
+        flat_top_k_probs = top_k_probs.view(-1)  # [B*S*K]
+
+        # 一次 sort 把同一 expert 的槽位排在一起（stable 保序）
+        sorted_vals, sort_order = torch.sort(flat_top_k_idx, stable=True)
+        # 排序后每个槽位对应的 (token_idx, prob)
+        token_indices_sorted = sort_order // K
+        probs_sorted = flat_top_k_probs[sort_order]
+
+        # 每个 expert 的分桶边界（一次 CPU 同步，替代原来 N 次 nonzero）
+        counts = torch.bincount(sorted_vals, minlength=N)
+        ends = torch.cumsum(counts, dim=0)
+        starts_cpu = (ends - counts).cpu().tolist()
+        ends_cpu = ends.cpu().tolist()
+
+        # 加权输出累积：直接按原始 token 位置累加，省掉 [B,S,K,H] 中间张量
+        flat_out = torch.zeros_like(flat_x)
+
         for expert_idx, expert in enumerate(self.experts):
-            mask = flat_top_k_idx == expert_idx  # 该专家
-            if mask.any():
-                expert_outputs[mask] = expert(expert_inputs[mask], token_ids=token_ids)
-        expert_outputs = (
-            expert_outputs.view(*top_k_probs.shape, -1) * top_k_probs.unsqueeze(-1)
-        ).sum(
-            dim=2
-        )  # 乘以对应权重求和得到最终输出
+            s, e = starts_cpu[expert_idx], ends_cpu[expert_idx]
+            if s < e:
+                token_idx = token_indices_sorted[s:e]
+                probs = probs_sorted[s:e].unsqueeze(-1)  # [n, 1]
+                expert_in = flat_x[token_idx]
+                expert_out = expert(expert_in, token_ids=token_ids)
+                # 乘权重后累积到对应 token（K>1 时多个 expert 加到同一 token）
+                # AMP 下 probs 经 softplus 可能是 float32，需匹配 buffer dtype
+                weighted = expert_out.to(flat_out.dtype) * probs.to(flat_out.dtype)
+                flat_out.index_add_(0, token_idx, weighted)
 
+        # 恢复 [B, S, H] 形状
+        expert_outputs = flat_out.view(*top_k_indices.shape[:-1], -1)
+        if self.args.latent_moe:
+            expert_outputs = self.latent_up(expert_outputs)
         return expert_outputs
 
 
@@ -436,7 +472,9 @@ class MyLMDecoderLayer(nn.Module):
             base_init_std=base_init_std
         )
         self.mlp = (
-            MoEFFN(args) if args.use_moe else FFN(args, base_init_std=base_init_std)
+            MoEFFN(args, base_init_std=base_init_std)
+            if args.use_moe
+            else FFN(args, base_init_std=base_init_std)
         )
         self.input_layernorm = RMSNorm(args.d_model)
         self.post_attention_layernorm = RMSNorm(args.d_model)
@@ -464,6 +502,23 @@ class MyLMDecoderLayer(nn.Module):
         x = residual + x
 
         return x
+
+
+def exclude_moe_from_compile(model: nn.Module) -> int:
+    """标记模型中所有 MoEFFN 层，使其在 torch.compile 时以 eager 模式执行。
+    MoE 的专家循环含数据依赖的 Python 循环与 CPU 同步（argsort/bincount 分桶），
+    被 compile 追踪后反而更慢（见 debug_moe.py），故编译时排除在外。
+    返回被排除的 MoE 层数。
+    """
+    n_disabled = 0
+    for module in model.modules():
+        if isinstance(module, MoEFFN):
+            module.forward = torch.compiler.disable(
+                module.forward, recursive=True,
+                reason="MoE 专家循环含 CPU 同步与数据依赖循环，eager 执行更快",
+            )
+            n_disabled += 1
+    return n_disabled
 
 
 class MyLM(nn.Module):
