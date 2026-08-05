@@ -1,8 +1,12 @@
+from re import A
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
 import tokenizers
+import math
+
+from models import MoEFFN
 
 
 class TextGenerator:
@@ -13,6 +17,7 @@ class TextGenerator:
         device,
         padding_side="right",
     ) -> None:
+        assert padding_side in ["right", "left", "none"], "padding_side应为'right'或'left'或'none'"
         self.tokenizer = tokenizer
         self.device = device
         # self.padding_side = padding_side
@@ -23,10 +28,15 @@ class TextGenerator:
             self.model = model
         self.seq_max_len = self.model.args.seq_max_len
         self.padding_side = padding_side
-        self.tokenizer.enable_padding(direction=padding_side, length=self.seq_max_len)
-        self.tokenizer.enable_truncation(
-            max_length=self.seq_max_len, direction=padding_side
-        )
+        if padding_side != "none":
+            self.tokenizer.enable_padding(direction=padding_side, length=self.seq_max_len, pad_id=0, pad_token="")
+            self.tokenizer.enable_truncation(
+                max_length=self.seq_max_len, direction=padding_side
+            )
+        elif padding_side == "none":
+            self.tokenizer.enable_truncation(
+                max_length=self.seq_max_len, direction="left"
+            )
 
     def generate(
         self,
@@ -55,7 +65,7 @@ class TextGenerator:
                 # 根据padding方向选择logits位置
                 if self.padding_side == "right":
                     logits = out[0, len(tokens) - 1, :]
-                elif self.padding_side == "left":
+                elif self.padding_side == "left" or "none":
                     logits = out[0, -1, :]
                 else:
                     raise ValueError("padding_side must be 'right' or 'left'")
@@ -269,7 +279,7 @@ class WarmUpStableDecayLR(torch.optim.lr_scheduler._LRScheduler):
                     # 线性衰减
                     progress = min(decay_steps / total_decay_steps, 1.0)
                     current_lr = base_lr + (self.min_lr - base_lr) * progress
-                
+
                 elif self.decay_mode == "exp":
                     # 指数衰减
                     if base_lr != 0 and self.min_lr >= 0 and base_lr > self.min_lr:
@@ -287,6 +297,85 @@ class WarmUpStableDecayLR(torch.optim.lr_scheduler._LRScheduler):
                 lrs.append(current_lr)
 
             return lrs
+
+
+class MoEStatsCollector:
+    """通过 forward hook 采集 MoE 负载均衡统计，对模型代码零侵入
+
+    用法:
+        collector = MoEStatsCollector(n_experts, n_experts_per_tok)
+        collector.register(model)      # 在 DataParallel 包裹后调用
+        collector.set_enabled(True)    # 需要记录的 forward 前开启
+        ...model(inputs)...
+        collector.set_enabled(False)
+        for layer_idx, stats in collector.stats(): ...
+    """
+
+    def __init__(self, n_experts: int, n_experts_per_tok: int):
+        self.n_experts = n_experts
+        self.n_experts_per_tok = n_experts_per_tok
+        self.enabled = False
+        self.layer_stats = {}  # layer_idx -> stats dict
+        self._handles = []
+
+    def register(self, model: nn.Module):
+        for layer_idx, block in enumerate(model.blocks):
+            if not isinstance(block.mlp, MoEFFN):
+                continue
+            handle = block.mlp.router.register_forward_hook(
+                lambda mod, args, output, idx=layer_idx: self._hook(idx, output)
+            )
+            self._handles.append(handle)
+        return self
+
+    def set_enabled(self, enabled: bool):
+        self.enabled = enabled
+
+    def stats(self):
+        """返回 [(layer_idx, stats), ...]，stats 字段见 _compute"""
+        return sorted(self.layer_stats.items())
+
+    def close(self):
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+
+    def _hook(self, layer_idx: int, router_logits):
+        if not self.enabled:
+            return
+        self.layer_stats[layer_idx] = self._compute(router_logits)
+
+    @torch.no_grad()
+    def _compute(self, router_logits):
+        """由 router logits 计算负载均衡指标（与 MoEFFN 实际路由使用同一份 logits）
+        - expert_load: 每个专家被路由的token占比 (n_experts,)
+        - aux_loss: Switch式负载均衡辅助损失 N * Σ f_i P_i（f=token占比, P=平均路由概率）
+        - router_entropy: 归一化路由熵（1.0=完全均匀）
+        - top1_conf: 路由top-1概率均值
+        - balance_ratio: max_load / mean_load（1.0=完全均匀）
+        """
+        N = self.n_experts
+        K = self.n_experts_per_tok
+        logits = router_logits.detach().float()  # [B, S, N]
+        # 各专家 token 占比（topk 与 MoEFFN.forward 完全一致）
+        _, topk_indices = torch.topk(logits, K, dim=-1)
+        counts = torch.bincount(topk_indices.view(-1), minlength=N)
+        total = counts.sum().clamp(min=1)
+        f = counts.float() / total
+        # Switch 式负载均衡辅助损失
+        probs = torch.softmax(logits, dim=-1)
+        P = probs.mean(dim=(0, 1))
+        aux_loss = N * (f * P).sum()
+        # 归一化路由熵
+        entropy = -(probs * torch.log(probs.clamp_min(1e-9))).sum(-1)
+        mean_load = f.mean()
+        return {
+            "expert_load": f.cpu(),
+            "aux_loss": aux_loss.item(),
+            "router_entropy": (entropy.mean() / math.log(N)).item(),
+            "top1_conf": probs.max(-1).values.mean().item(),
+            "balance_ratio": (f.max() / mean_load).item() if mean_load > 0 else 1.0,
+        }
 
 
 # 使用示例

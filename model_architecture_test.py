@@ -10,7 +10,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Optional, Dict, Any, Union, Type
 
 from utils import model_structure
-from dataset import StreamingTextDataset
+from dataset import PretrainTextDataset
 from models import MyLM, MyLMArgs
 from model_baseline import LLaMABaseline, GPT2Baseline
 import tokenizers
@@ -127,7 +127,7 @@ class ModelArchitectureTester:
 
     def _build_dataloader(self):
         """构建数据加载器"""
-        dataset = StreamingTextDataset(
+        dataset = PretrainTextDataset(
             self.config.data_dir,
             downsample=self.config.dataset_downsample,
             seq_max_len=self.config.seq_max_len,

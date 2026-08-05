@@ -6,14 +6,16 @@ import tokenizers
 import json
 import sys
 import random
+import numpy as np
 
 # import tracemalloc
 
 
-class StreamingTextDataset(torch.utils.data.Dataset):
+class PretrainTextDataset(torch.utils.data.Dataset):
     """
     流式文本数据集，避免将整个数据集加载到内存中
     只存储文件路径和行位置信息，在需要时才读取特定行
+    返回格式：(input, output, mask)，其中mask为loss mask，包括pad mask
     """
 
     def __init__(
@@ -92,12 +94,26 @@ class StreamingTextDataset(torch.utils.data.Dataset):
 
         return seq
 
+    def _create_loss_mask(
+        self, padded_seq: list[int], padding_value: int = 0
+    ) -> list[int]:
+        """
+        创建loss mask，用于标识需要计算loss的位置
+        Args:
+            padded_seq: 填充后的序列
+            padding_value: padding的值（通常为0）
+        Returns:
+            mask: 有效位置为1，padding位置为0
+        """
+        return [0 if token == padding_value else 1 for token in padded_seq]
+
     def __len__(self):
         return len(self.line_offsets)
 
     def __getitem__(self, index):
         """
         根据索引获取数据样本，只在需要时读取特定行
+        返回格式：(input, output, mask)
         """
         # 根据索引定位并读取特定行
         with open(self.data_dir, "r", encoding="utf-8") as f:
@@ -123,7 +139,110 @@ class StreamingTextDataset(torch.utils.data.Dataset):
         # 将列表转换为tensor
         raw_tensor = torch.tensor(raw, dtype=torch.long)
 
-        return (raw_tensor[:-1].contiguous(), raw_tensor[1:].contiguous())
+        inputs = raw_tensor[:-1].contiguous()
+        outputs = raw_tensor[1:].contiguous()
+
+        # 生成loss mask（对应output位置）
+        mask = self._create_loss_mask(outputs.cpu().tolist())
+        mask_tensor = torch.tensor(mask, dtype=torch.float32)
+
+        return (inputs, outputs, mask_tensor)
+
+
+class PretrainTokenIDDataset(torch.utils.data.Dataset):
+    """
+    二进制 token ID 数据集（配合 generate_dataset_v3.py 产物）。
+    直接从 .npy (2D uint16, shape=(N, SENTENCE_MAXLEN)) 加载，mmap 流式访问。
+    无需 tokenizer，__getitem__ 不做任何编码。
+    返回格式：(input, output, mask)，mask 基于 pad_value=0。
+
+    约定：存储长度 = seq_max_len + 1（因 __getitem__ 做 [:-1]/[1:] 切片）。
+    若存储长度 > seq_max_len + 1，truncate；若 < seq_max_len + 1，pad。
+    推荐：生成时 SENTENCE_MAXLEN = 训练 seq_max_len + 1，loader 无需 pad。
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        seq_max_len: int = 192,
+        downsample: int = 1,
+        padding_side: str = "right",
+        pad_value: int = 0,
+        dtype=np.uint16,
+    ):
+        super().__init__()
+        self.data_dir = data_dir
+        self.seq_max_len = seq_max_len
+        self.padding_side = padding_side
+        self.pad_value = pad_value
+        self.dtype = dtype
+        # mmap 流式加载：不会一次性把整个文件读进内存
+        self.data = np.load(data_dir, mmap_mode="r")
+        self.n_samples = self.data.shape[0]
+        self.storage_len = self.data.shape[1]   # SENTENCE_MAXLEN，通常 = seq_max_len + 1
+        # 下采样：随机抽取索引（与 PretrainTextDataset 行为对齐）
+        if downsample != 1:
+            k = int(self.n_samples * downsample)
+            self.indices = random.sample(range(self.n_samples), k)
+        else:
+            self.indices = list(range(self.n_samples))
+
+    def pad_seq(
+        self,
+        seq: np.ndarray,
+        max_len: int,
+        padding_value: int = 0,
+        padding_side: str = "right",
+    ) -> np.ndarray:
+        """对序列进行截断+填充（与 PretrainTextDataset.pad_seq 逻辑一致）"""
+        if padding_side == "right":
+            seq = seq[:max_len]
+            if len(seq) < max_len:
+                seq = np.concatenate(
+                    [seq, np.full(max_len - len(seq), padding_value, dtype=seq.dtype)]
+                )
+        elif padding_side == "left":
+            seq = seq[-max_len:]
+            if len(seq) < max_len:
+                seq = np.concatenate(
+                    [np.full(max_len - len(seq), padding_value, dtype=seq.dtype), seq]
+                )
+        else:
+            raise ValueError("padding_side must be 'left' or 'right'")
+        return seq
+
+    def _create_loss_mask(self, padded_seq, padding_value: int = 0) -> list[int]:
+        """生成 loss mask：有效位置为 1，padding 位置为 0"""
+        return [0 if int(t) == padding_value else 1 for t in padded_seq]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        """
+        根据索引获取数据样本，只在需要时读取对应行（mmap）
+        返回格式：(input, output, mask)
+        """
+        # 从 mmap 拷出一行（转为本机 dtype）
+        row = np.array(self.data[self.indices[index]], dtype=self.dtype)
+        # 截断/填充到 seq_max_len + 1（因为后续 [:-1]/[1:] 切片会少 1）
+        target_len = self.seq_max_len + 1
+        raw = self.pad_seq(
+            row,
+            max_len=target_len,
+            padding_value=self.pad_value,
+            padding_side=self.padding_side,
+        )
+        raw_tensor = torch.tensor(raw, dtype=torch.long)
+
+        inputs = raw_tensor[:-1].contiguous()   # length = seq_max_len
+        outputs = raw_tensor[1:].contiguous()    # length = seq_max_len
+
+        # 生成 loss mask（对应 output 位置）
+        mask = self._create_loss_mask(outputs.cpu().tolist(), padding_value=self.pad_value)
+        mask_tensor = torch.tensor(mask, dtype=torch.float32)
+
+        return (inputs, outputs, mask_tensor)
 
 
 class RuntimeTextDatasetV4(torch.utils.data.Dataset):
@@ -141,6 +260,7 @@ class RuntimeTextDatasetV4(torch.utils.data.Dataset):
 
         Args:
             data_dir (str): 数据目录的路径。
+            seq_max_len (int): 序列的最大长度。
             vocab_size (int): 词汇表的大小。
             downsample (int): 数据下采样率，控制是否对数据进行下采样。
             batch (bool): 是否使用batch流程，速度提升但无进度条
@@ -536,7 +656,7 @@ class Vocab:
 if __name__ == "__main__":
     import time
 
-    dataset = StreamingTextDataset(
+    dataset = PretrainTextDataset(
         r"data_large_ChatML.txt",
         downsample=10,
         tokenizer=tokenizers.Tokenizer.from_file(r"bpe_tokenizer_6k_0724_ChatML.json"),

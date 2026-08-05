@@ -1,3 +1,4 @@
+import torch
 import tokenizers
 import string
 from tokenizers import (
@@ -8,46 +9,89 @@ from tokenizers import (
     processors,
     decoders,
     Tokenizer,
+    Regex,
 )
 
-
-BBPE = False
+BBPE = True  # 是否使用 ByteLevel BPE
+SPECIAL_TOKENS = [
+    "<|endoftext|>",
+    "<|beginoftext|>",
+    "<|pad|>",
+    "<|unk|>",
+    "<|im_end|>",
+    "<|im_start|>",
+]
 
 # 1. 初始化 BPE 模型
-tokenizer = Tokenizer(models.BPE(unk_token="<|unk|>"))
-tokenizer.normalizer = normalizers.NFKD()
+tokenizer = Tokenizer(models.BPE(unk_token="<|unk|>", cache_capacity=0))
+
+
+if BBPE:
+    tokenizer.normalizer = normalizers.NFC()
+else:
+    tokenizer.normalizer = normalizers.NFKD()
 
 # 2. 设置预分词器
-tokenizer.pre_tokenizer = (
-    pre_tokenizers.ByteLevel() if BBPE else pre_tokenizers.BertPreTokenizer()
-)
-initial_alphabet = list(string.ascii_letters) + list(string.digits) + ['\n']
+if BBPE:
+    PRETOKENIZE_REGEX = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
+    tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
+        pre_tokenizers.Split(Regex(PRETOKENIZE_REGEX),
+                             behavior="isolated", invert=False),
+        pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+    ])
+else:
+    tokenizer.pre_tokenizer = pre_tokenizers.BertPreTokenizer()
+
+if BBPE:
+    initial_alphabet = []
+else:
+    initial_alphabet = list(string.ascii_letters) + \
+        list(string.digits) + ["\n"]
+
 print(initial_alphabet)
+
 # 3. 定义训练器
 trainer = trainers.BpeTrainer(
-    special_tokens=["<|endoftext|>", "<|unk|>", "<|im_end|>", "<|im_start|>"],
+    special_tokens=SPECIAL_TOKENS,
     initial_alphabet=initial_alphabet,
-    vocab_size=6140,  # 词汇表大小
-    limit_alphabet=4800,
-    min_frequency=1,  # pair最小出现频率
+    vocab_size=7168,
+    limit_alphabet=65535,
+    min_frequency=2,
     show_progress=True,
 )
 
-# 4. 训练分词器
-files = [
-    # r"Train_text\SkyPile2023-14_zh_head_0000_downsample2x_processed.jsonl",
-    r"train_text\WanJuan1.0part-000036-a894b46e-downsample20x-processed.txt",
-    r"train_text\SkyPile2022-40_zh_middle_0011_processed.txt", # 通用知识
-    r"train_text\时政文章.txt", # 时政
-    r"train_text\斗罗大陆4终极斗罗.txt", # 泛化
-    r"train_text\高三议论文-作文网20220310-20200806.txt", # 泛化
-    r"train_text\SFT\Infinity-Instruct-Gen-00000-of-00015-processed.txt" # 优化对话
-]
-tokenizer.train(files, trainer)
+# 4. 使用 torch DataLoader 加载数据
+file_path = r"train_text\merged.txt"
+
+class TextDataset(torch.utils.data.Dataset):
+    def __init__(self, file_path, batch_size):
+        self.batch_size = batch_size
+        self.lines = []
+
+        with open(file_path, 'r', encoding='utf-8') as file:
+            for line in file:
+                self.lines.append(line.strip())  # Remove newline characters
+
+    def __len__(self):
+        return len(self.lines)
+
+    def __getitem__(self, idx):
+        batch = self.lines[idx:idx + self.batch_size]
+        return batch
+
+
+# Create the dataset, and process the full file.
+dataset = TextDataset(file_path, batch_size=1)
+dataset_len = len(dataset)
+# DataLoader for efficient batch processing
+dataloader = torch.utils.data.DataLoader(dataset, batch_size=None)
+
+# 使用 train_from_iterator 替代 train(files, trainer)
+tokenizer.train_from_iterator(dataloader, trainer=trainer, length=dataset_len)
 
 if BBPE:
-    tokenizer.post_processor = processors.ByteLevel()
+    tokenizer.post_processor = processors.ByteLevel(add_prefix_space=False)
     tokenizer.decoder = decoders.ByteLevel()
 
 # 5. 保存分词器
-tokenizer.save("bpe_tokenizer_6k_0724_ChatML.json")
+tokenizer.save(r"bbpe_tokenizer_6k_260715.json")

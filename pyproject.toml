@@ -1,0 +1,27 @@
+[project]
+name = "pytorch-gpt"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "bitsandbytes>=0.50.0",
+    "matplotlib>=3.10.9",
+    "pandas>=3.0.3",
+    "pyarrow>=24.0.0",
+    "pyparsing>=3.3.2",
+    "regex>=2026.7.19",
+    "sentencepiece>=0.2.2",
+    "tensorboard>=2.20.0",
+    "tokenizers>=0.23.1",
+    "torch==2.13.0+cu132",
+    "tqdm>=4.66.5",
+    "triton-windows>=3.7.1.post27",
+]
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+
+[[tool.uv.index]]
+url = "https://mirrors.nju.edu.cn/pytorch/whl/cu132"
