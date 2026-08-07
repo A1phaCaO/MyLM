@@ -1,0 +1,42 @@
+[
+  {
+    "timestamp": "2026-07-29 12:26:32",
+    "agent_name": "sdpa_fp16_v1",
+    "generation": 1,
+    "score": 1745793.5369024603,
+    "throughput": 1745793.5369024603,
+    "is_correct": true,
+    "code_description": "Fused QKV + F.scaled_dot_product_attention (FlashAttention) + FP16 autocast + is_causal",
+    "parameters": {},
+    "benchmark_config": {
+      "d_model": 512,
+      "d_head": 64,
+      "n_heads": null,
+      "seq_len": 256,
+      "batch_size": 16,
+      "dropout": 0.0,
+      "n_warmup": 20,
+      "n_iters": 100
+    }
+  },
+  {
+    "timestamp": "2026-07-29 13:02:49",
+    "agent_name": "bf16_compile_maxautotune_nocudagraph",
+    "generation": 2,
+    "score": 3306110.6546219895,
+    "throughput": 3306110.6546219895,
+    "is_correct": true,
+    "code_description": "BF16 compute (weights pre-cast to bf16, RoPE cached as bf16) + torch.compile(mode=max-autotune-no-cudagraphs) for inductor fusion + inline RoPE (no rotate_half helper) + reshape (skip contiguous) + cuDNN-only SDPA backend + no autocast wrapper + no final dtype cast. Skips autocast overhead and lets compile fuse matmuls directly in bf16.",
+    "parameters": {},
+    "benchmark_config": {
+      "d_model": 512,
+      "d_head": 64,
+      "n_heads": null,
+      "seq_len": 256,
+      "batch_size": 16,
+      "dropout": 0.0,
+      "n_warmup": 20,
+      "n_iters": 100
+    }
+  }
+]
