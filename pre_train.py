@@ -59,10 +59,10 @@ class TrainingConfig:
     padding_side = "right"
 
     # 训练参数
-    seed: int = 37
+    seed: int = 42
     epochs: int = 1
     batch_size: int = 64
-    batch_acceleration: int = 3
+    batch_acceleration: int = 4
     dataset_downsample: int = 1
     valset_rate: float = 0.0018
     val_interval_step: int = 1000
@@ -75,10 +75,10 @@ class TrainingConfig:
     exclude_moe_from_compile: bool = True
 
     # 优化参数
-    learning_rate: float = 1e-3
-    min_learning_rate: float = 1e-4  # WSD LRS衰减到1%
-    lr_decay_start_rate: int = 0.8  # 最后衰减
-    warmup_steps: int = 150
+    learning_rate: float = 4e-3
+    min_learning_rate: float = 4e-4  # WSD LRS衰减到10%
+    lr_decay_start_rate: int = 0.75  # 最后衰减
+    warmup_steps: int = 2
     use_amp: bool = True
 
     model_args = MyLMArgs(
@@ -93,12 +93,13 @@ class TrainingConfig:
         seq_max_len=seq_max_len,
         use_moe=True,
         n_experts=6,
-        n_experts_per_tok=2,
+        n_experts_per_tok=3,
         d_conv=None,
         conv_bias=None,
         ffn_bias=False,
         attn_bias=True,
         dropout=0.05,
+        base_init_std=0.02
     )
 
     # 新增参数：checkpoint保存间隔步数
@@ -108,6 +109,7 @@ class TrainingConfig:
     # 新增参数：断点续训的checkpoint路径
     # resume_from: Optional[str] = r"ckpt\ckpt_epoch_0_step_6000.pth"
     resume_from: Optional[str] = None
+
 
 class PreTrainer:
     def __init__(self, config: TrainingConfig):

@@ -24,7 +24,8 @@ class GPT2Baseline(nn.Module):
         self.embedding_ln = nn.LayerNorm(args.d_model)
 
         # Transformer块
-        self.blocks = nn.ModuleList([GPT2Block(args) for _ in range(args.n_layers)])
+        self.blocks = nn.ModuleList([GPT2Block(args)
+                                    for _ in range(args.n_layers)])
 
         # 输出层
         self.ln_f = nn.LayerNorm(args.d_model)
@@ -134,7 +135,8 @@ class GPT2Attention(nn.Module):
 
         # 计算注意力分数
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.d_head))
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=att.device)).view(1, 1, seq_len, seq_len)
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=att.device)).view(
+            1, 1, seq_len, seq_len)
         att = att.masked_fill(causal_mask == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
@@ -142,7 +144,8 @@ class GPT2Attention(nn.Module):
         # 应用注意力权重
         y = att @ v  # (batch, heads, seq, head_dim)
         y = (
-            y.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+            y.transpose(1, 2).contiguous().view(
+                batch_size, seq_len, self.d_model)
         )  # 重新组合多头
 
         # 输出投影
@@ -182,7 +185,8 @@ class LLaMABaseline(nn.Module):
         self.token_embedding = nn.Embedding(args.vocab_size, args.d_model)
 
         # Transformer块
-        self.blocks = nn.ModuleList([LLaMABlock(args) for _ in range(args.n_layers)])
+        self.blocks = nn.ModuleList([LLaMABlock(args)
+                                    for _ in range(args.n_layers)])
 
         # 输出层
         self.norm = RMSNorm(args.d_model)
@@ -271,8 +275,10 @@ class LLaMAAttention(nn.Module):
         self.o_proj = nn.Linear(args.d_model, args.d_model)
 
         # RoPE位置编码缓存
-        self.register_buffer("cos_cached", torch.zeros(args.seq_max_len, args.d_head))
-        self.register_buffer("sin_cached", torch.zeros(args.seq_max_len, args.d_head))
+        self.register_buffer("cos_cached", torch.zeros(
+            args.seq_max_len, args.d_head))
+        self.register_buffer("sin_cached", torch.zeros(
+            args.seq_max_len, args.d_head))
         self._init_rope()
 
         self.attn_dropout = nn.Dropout(args.dropout)
@@ -283,7 +289,8 @@ class LLaMAAttention(nn.Module):
         d_head_half = self.d_head // 2
         # 创建频率数组，长度为d_head_half
         inv_freq = 1.0 / (
-            10000 ** (torch.arange(0, d_head_half, dtype=torch.float) / d_head_half)
+            10000 ** (torch.arange(0, d_head_half,
+                      dtype=torch.float) / d_head_half)
         )
 
         t = torch.arange(self.seq_max_len, dtype=torch.float)
@@ -298,7 +305,7 @@ class LLaMAAttention(nn.Module):
     def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
         """旋转一半维度"""
         x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
+        x2 = x[..., x.shape[-1] // 2:]
         return torch.cat((-x2, x1), dim=-1)
 
     def _apply_rotary_pos_emb(
@@ -340,7 +347,8 @@ class LLaMAAttention(nn.Module):
 
         # 计算注意力分数
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.d_head))
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=att.device)).view(1, 1, seq_len, seq_len)
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=att.device)).view(
+            1, 1, seq_len, seq_len)
         att = att.masked_fill(causal_mask == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
@@ -348,7 +356,8 @@ class LLaMAAttention(nn.Module):
         # 应用注意力权重
         y = att @ v  # (batch, heads, seq, head_dim)
         y = (
-            y.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+            y.transpose(1, 2).contiguous().view(
+                batch_size, seq_len, self.d_model)
         )  # 重新组合多头
 
         # 输出投影
@@ -367,7 +376,8 @@ class LLaMAMLP(nn.Module):
         self.act_fn = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        down_proj = self.down_proj(self.act_fn(
+            self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
 
@@ -383,5 +393,6 @@ class RMSNorm(nn.Module):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = hidden_states * \
+            torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)

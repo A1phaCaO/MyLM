@@ -26,10 +26,6 @@ class MyLMArgs:
     d_head: int = 64
     dropout: float = 0.1
     base_init_std: float = 0.02  # 基础初始化标准差
-    resid_pdrop: float = 0.1  # 残差连接dropout
-    resid_scale: float = 1.0  # 残差流缩放参数
-    layer_scale: float = 1.0  # 层缩放参数
-    use_deepnet_scaling: bool = True  # 是否使用DeepNet缩放策略
 
 
 class RMSNorm(torch.nn.Module):
@@ -94,7 +90,8 @@ class GPT2PositionEmbedding(nn.Module):
 
         assert (
             seq_len <= self.pos_emb.num_embeddings
-        ), f"序列长度 {seq_len} 超过预设最大值 {self.pos_emb.num_embeddings}"  # 检查序列长度是否超限
+            # 检查序列长度是否超限
+        ), f"序列长度 {seq_len} 超过预设最大值 {self.pos_emb.num_embeddings}"
         # 生成位置编码并相加
         pos = torch.arange(seq_len).to(x.device)  # (seq_len,)
         pos_emb = self.pos_emb(pos)  # (seq_len, d_model)
@@ -195,11 +192,15 @@ class Attention(nn.Module):
         self.use_gate = use_gate
 
         # 注意力投影层
-        self.q_proj = nn.Linear(args.d_model, args.d_model, bias=args.attn_bias)
-        self.k_proj = nn.Linear(args.d_model, args.d_model, bias=args.attn_bias)
-        self.v_proj = nn.Linear(args.d_model, args.d_model, bias=args.attn_bias)
-        self.o_proj = nn.Linear(args.d_model, args.d_model, bias=args.attn_bias)
-        
+        self.q_proj = nn.Linear(
+            args.d_model, args.d_model, bias=args.attn_bias)
+        self.k_proj = nn.Linear(
+            args.d_model, args.d_model, bias=args.attn_bias)
+        self.v_proj = nn.Linear(
+            args.d_model, args.d_model, bias=args.attn_bias)
+        self.o_proj = nn.Linear(
+            args.d_model, args.d_model, bias=args.attn_bias)
+
         # 门控层（仅在使用门控时创建）
         if use_gate:
             self.gate = nn.Linear(args.d_model, args.d_model, bias=False)
@@ -234,7 +235,8 @@ class Attention(nn.Module):
         d_head_half = self.d_head // 2
         # 创建频率数组，长度为d_head_half
         inv_freq = 1.0 / (
-            10000 ** (torch.arange(0, d_head_half, dtype=torch.float) / d_head_half)
+            10000 ** (torch.arange(0, d_head_half,
+                      dtype=torch.float) / d_head_half)
         )
 
         t = torch.arange(self.seq_max_len, dtype=torch.float)
@@ -254,7 +256,7 @@ class Attention(nn.Module):
     def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
         """旋转一半维度"""
         x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
+        x2 = x[..., x.shape[-1] // 2:]
         return torch.cat((-x2, x1), dim=-1)
 
     def _apply_rotary_pos_emb(
@@ -277,7 +279,7 @@ class Attention(nn.Module):
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
-        
+
         # 计算门控（仅在使用门控时）
         if self.use_gate:
             gate = F.sigmoid(self.gate(x))
@@ -314,15 +316,17 @@ class Attention(nn.Module):
         if mask is not None:
             # 简单检查mask维度，不符合要求直接抛出异常
             if mask.dim() != 4:
-                raise ValueError(f"Mask must be 4-dimensional, got {mask.dim()} dimensions")
+                raise ValueError(
+                    f"Mask must be 4-dimensional, got {mask.dim()} dimensions")
             if mask.shape != (batch_size, 1, seq_len, seq_len):
-                raise ValueError(f"Mask shape must be {(batch_size, 1, seq_len, seq_len)}, got {mask.shape}")
+                raise ValueError(
+                    f"Mask shape must be {(batch_size, 1, seq_len, seq_len)}, got {mask.shape}")
             # 合并因果掩码和外部mask
             combined_mask = causal_mask & mask
         else:
             # 只使用因果掩码
             combined_mask = causal_mask
-        
+
         att = att.masked_fill(combined_mask == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
@@ -332,19 +336,22 @@ class Attention(nn.Module):
             # 门控注意力：不对V激活，而是在输出后应用门控
             y = att @ v  # (batch, heads, seq, head_dim)
             y = (
-                y.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+                y.transpose(1, 2).contiguous().view(
+                    batch_size, seq_len, self.d_model)
             )  # 重新组合多头
             y = y * gate  # 应用门控
         else:
             # 标准注意力：对V应用sigmoid激活
             y = att @ F.sigmoid(v)  # (batch, heads, seq, head_dim)
             y = (
-                y.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+                y.transpose(1, 2).contiguous().view(
+                    batch_size, seq_len, self.d_model)
             )  # 重新组合多头
-        
+
         # 输出投影
         y = self.resid_dropout(self.o_proj(y))
         return y
+
 
 class FFN(nn.Module):
     """LLaMA MLP层"""
@@ -381,11 +388,13 @@ class MoEFFN(nn.Module):
         super().__init__()
         self.args = args
         if args.latent_moe:
-            self.latent_down = nn.Linear(args.d_model, args.d_latent, bias=False)
+            self.latent_down = nn.Linear(
+                args.d_model, args.d_latent, bias=False)
             self.latent_up = nn.Linear(args.d_latent, args.d_model, bias=False)
 
         self.router = nn.Linear(args.d_model, args.n_experts, bias=False)
-        self.experts = nn.ModuleList([FFN(args) for _ in range(args.n_experts)])
+        self.experts = nn.ModuleList([FFN(args)
+                                     for _ in range(args.n_experts)])
         self._reset_parameters(base_init_std)
 
     def _reset_parameters(self, base_init_std=0.02):
@@ -447,7 +456,8 @@ class MoEFFN(nn.Module):
                 expert_out = expert(expert_in, token_ids=token_ids)
                 # 乘权重后累积到对应 token（K>1 时多个 expert 加到同一 token）
                 # AMP 下 probs 经 softplus 可能是 float32，需匹配 buffer dtype
-                weighted = expert_out.to(flat_out.dtype) * probs.to(flat_out.dtype)
+                weighted = expert_out.to(
+                    flat_out.dtype) * probs.to(flat_out.dtype)
                 flat_out.index_add_(0, token_idx, weighted)
 
         # 恢复 [B, S, H] 形状
@@ -467,7 +477,7 @@ class MyLMDecoderLayer(nn.Module):
         super().__init__()
         self.args = args
         self.attn = Attention(
-            args, 
+            args,
             use_gate=(layer_idx % 2 == 0),  # 偶数层使用门控注意力，奇数层使用标准注意力
             base_init_std=base_init_std
         )
@@ -488,9 +498,11 @@ class MyLMDecoderLayer(nn.Module):
         # 首先创建序列级别的mask
         seq_mask = (x.sum(dim=-1) != 0)  # (batch_size, seq_len)
         # 扩展为完整的注意力mask形状
-        pad_mask = seq_mask.unsqueeze(1).unsqueeze(2)  # (batch_size, 1, 1, seq_len)
+        pad_mask = seq_mask.unsqueeze(1).unsqueeze(
+            2)  # (batch_size, 1, 1, seq_len)
         # 扩展最后一个维度以匹配序列长度
-        pad_mask = pad_mask.expand(-1, -1, seq_len, -1)  # (batch_size, 1, seq_len, seq_len)
+        # (batch_size, 1, seq_len, seq_len)
+        pad_mask = pad_mask.expand(-1, -1, seq_len, -1)
         pad_mask = pad_mask.bool()  # 确保是bool类型
         x = self.attn(x, token_ids=token_ids, mask=pad_mask)
         x = residual + x
