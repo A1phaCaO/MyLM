@@ -8,20 +8,26 @@ import random
 #   - (0, 1) : 降采样，随机抽取该百分比的行。例如 0.1 表示随机抽取 10% 的行
 #   - 1      : 不采样，使用全部数据
 #   - > 1    : 重复（repeat），将数据重复若干次。例如 3 表示将数据重复 3 倍
+# FILE_RATIO = {
+#     r"train_text\WanJuan1.0part-000036-a894b46e-downsample30x-processed.txt": 0.27,
+#     r"train_text\ultrafineweb-zh-part-001-of-256-downsample8x.txt": 0.9,
+#     r"train_text\SkyPile2023-14_zh_middle_0010_processed.txt": 1,
+#     r"train_text\时政文章.txt": 1,
+#     r"train_text\斗罗大陆4终极斗罗.txt": 0.04,
+#     r"train_text\高三议论文-作文网20220310-20200806.txt": 1,
+#     r"train_text\SFT\Infinity-Instruct-Gen-00000-of-00015-processed.txt": 0.8,
+#     r"train_text\ultrafineweb-l3-mutistyle-en-part0.txt": 0.2,
+#     r"train_text\ultrafineweb-l3-mutistyle-cn-part0.txt": 0.45,
+# }
+
 FILE_RATIO = {
-    r"train_text\WanJuan1.0part-000036-a894b46e-downsample30x-processed.txt": 0.27,
-    r"train_text\ultrafineweb-zh-part-001-of-256-downsample8x.txt": 0.9,
-    r"train_text\SkyPile2023-14_zh_middle_0010_processed.txt": 1,
-    r"train_text\时政文章.txt": 1,
-    r"train_text\斗罗大陆4终极斗罗.txt": 0.04,
-    r"train_text\高三议论文-作文网20220310-20200806.txt": 1,
-    r"train_text\SFT\Infinity-Instruct-Gen-00000-of-00015-processed.txt": 0.8,
-    r"train_text\ultrafineweb-l3-mutistyle-en-part0.txt": 0.2,
-    r"train_text\ultrafineweb-l3-mutistyle-cn-part0.txt": 0.45,
+    r"data_sft256.txt": 1,
+    r"data_sft384.txt": 1,
+    # r"data_sft512.txt": 1
 }
 
 # 输出文件路径
-OUTPUT_PATH = r"train_text\merged.txt"
+OUTPUT_PATH = r"data_sft-256-384-merge.txt"
 
 # 随机种子，保证可复现；设为 None 则每次随机
 SEED = 42
