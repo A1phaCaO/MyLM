@@ -65,7 +65,7 @@ class TextGenerator:
                 # 根据padding方向选择logits位置
                 if self.padding_side == "right":
                     logits = out[0, len(tokens) - 1, :]
-                elif self.padding_side == "left" or "none":
+                elif self.padding_side in ("left", "none"):
                     logits = out[0, -1, :]
                 else:
                     raise ValueError("padding_side must be 'right' or 'left'")
@@ -300,7 +300,7 @@ class WarmUpStableDecayLR(torch.optim.lr_scheduler._LRScheduler):
 
 
 class MoEStatsCollector:
-    """通过 forward hook 采集 MoE 负载均衡统计，对模型代码零侵入
+    """通过 forward hook 采集 FixedCap+DS-bias MoE 的运行时负载统计，零侵入。
 
     用法:
         collector = MoEStatsCollector(n_experts, n_experts_per_tok)
@@ -309,6 +309,12 @@ class MoEStatsCollector:
         ...model(inputs)...
         collector.set_enabled(False)
         for layer_idx, stats in collector.stats(): ...
+
+    统计基于 DS-bias 修正后的 logits（与实际 topk 路由完全一致），
+    只保留 3 个关键信号:
+    - expert_load: 各专家实际 token 占比 (n_experts,)
+    - drop_rate:   FixedCap 超容量丢 token 率 (每专家 M 槽装不下的比例)
+    - router_entropy: 归一化路由熵 (1.0=完全均匀)
     """
 
     def __init__(self, n_experts: int, n_experts_per_tok: int):
@@ -317,12 +323,15 @@ class MoEStatsCollector:
         self.enabled = False
         self.layer_stats = {}  # layer_idx -> stats dict
         self._handles = []
+        self._mlps = {}        # layer_idx -> MoEFFN (读取 last_drop/expert_bias)
 
     def register(self, model: nn.Module):
         for layer_idx, block in enumerate(model.blocks):
-            if not isinstance(block.mlp, MoEFFN):
+            mlp = getattr(block, "mlp", None)
+            if not isinstance(mlp, MoEFFN):
                 continue
-            handle = block.mlp.router.register_forward_hook(
+            self._mlps[layer_idx] = mlp
+            handle = mlp.router.register_forward_hook(
                 lambda mod, args, output, idx=layer_idx: self._hook(idx, output)
             )
             self._handles.append(handle)
@@ -340,41 +349,36 @@ class MoEStatsCollector:
             handle.remove()
         self._handles.clear()
 
+    @torch._dynamo.disable
     def _hook(self, layer_idx: int, router_logits):
         if not self.enabled:
             return
-        self.layer_stats[layer_idx] = self._compute(router_logits)
+        mlp = self._mlps.get(layer_idx)
+        latest_drop = float(getattr(mlp, "last_drop", 0.0)) if mlp is not None else 0.0
+        self.layer_stats[layer_idx] = self._compute(router_logits, latest_drop, mlp)
 
     @torch.no_grad()
-    def _compute(self, router_logits):
-        """由 router logits 计算负载均衡指标（与 MoEFFN 实际路由使用同一份 logits）
-        - expert_load: 每个专家被路由的token占比 (n_experts,)
-        - aux_loss: Switch式负载均衡辅助损失 N * Σ f_i P_i（f=token占比, P=平均路由概率）
-        - router_entropy: 归一化路由熵（1.0=完全均匀）
-        - top1_conf: 路由top-1概率均值
-        - balance_ratio: max_load / mean_load（1.0=完全均匀）
+    def _compute(self, router_logits, latest_drop=0.0, mlp=None):
+        """由 router logits 计算负载均衡指标（与 MoEFFN 实际路由同一份 logits）
+        drop_rate 取该层最近一次 forward 的 last_drop (hook 触发时上一轮的值,
+        步级观测不影响趋势)。
         """
         N = self.n_experts
         K = self.n_experts_per_tok
         logits = router_logits.detach().float()  # [B, S, N]
-        # 各专家 token 占比（topk 与 MoEFFN.forward 完全一致）
+        # DS bias 修正后与实际 topk 路由完全一致
+        if mlp is not None and hasattr(mlp, "expert_bias"):
+            logits = logits + mlp.expert_bias.float()
         _, topk_indices = torch.topk(logits, K, dim=-1)
         counts = torch.bincount(topk_indices.view(-1), minlength=N)
         total = counts.sum().clamp(min=1)
         f = counts.float() / total
-        # Switch 式负载均衡辅助损失
         probs = torch.softmax(logits, dim=-1)
-        P = probs.mean(dim=(0, 1))
-        aux_loss = N * (f * P).sum()
-        # 归一化路由熵
         entropy = -(probs * torch.log(probs.clamp_min(1e-9))).sum(-1)
-        mean_load = f.mean()
         return {
             "expert_load": f.cpu(),
-            "aux_loss": aux_loss.item(),
+            "drop_rate": latest_drop,
             "router_entropy": (entropy.mean() / math.log(N)).item(),
-            "top1_conf": probs.max(-1).values.mean().item(),
-            "balance_ratio": (f.max() / mean_load).item() if mean_load > 0 else 1.0,
         }
 
 

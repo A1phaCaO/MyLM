@@ -10,9 +10,9 @@ import tokenizers
 
 
 # 导入模型文件
-model_dir = r"model\model_textencoder.pth"
+model_dir = r"model\model_xl_sft.pth"
 tokenizer_dir = r"bbpe_tokenizer_7k_260723_xl.json"
-config_dir = r"model\config.json"
+config_dir = r"model\config_xl_0810.json"
 
 with open(config_dir, 'r', encoding='utf-8') as f:
     config = json.load(f)
@@ -40,6 +40,9 @@ args = m.MyLMArgs(
             n_experts=config['n_experts'],
             n_heads=config['n_heads'],
             d_head=config['d_head'],
+            d_latent=config['d_latent'],
+            latent_moe=config['latent_moe'],
+            n_experts_per_tok=config['n_experts_per_tok'],
             vocab_size=tokenizer.get_vocab_size(),
             seq_max_len=config['seq_max_len'],
             conv_bias=False,
@@ -96,8 +99,8 @@ except Exception as e:
 
 test_generator = TextGenerator(model, tokenizer, 'cuda', padding_side="none")
 MAX_LEN = 256
-T=0.6
-INSTURCT_MODE = False
+T=0.7
+INSTURCT_MODE = True
 
 while True:
     if INSTURCT_MODE:
@@ -119,8 +122,8 @@ while True:
                     temperature=T,
                     top_k=20,
                     # top_p=0.7,
-                    frequency_penalty=1,
-                    print_out=False
+                    frequency_penalty=1.0,
+                    print_out=True
                 )
             )
         )
