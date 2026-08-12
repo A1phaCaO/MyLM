@@ -1,0 +1,1 @@
+uv run tensorboard --logdir logs

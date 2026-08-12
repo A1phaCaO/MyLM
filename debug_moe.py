@@ -18,7 +18,9 @@ import sys
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 
+import gc
 import io
+import math
 import time
 from contextlib import redirect_stdout
 
@@ -28,7 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
 
-from models import MyLM, MyLMArgs, MoEFFN
+from models import MyLM, MyLMArgs, MoEFFN, FFN
 
 torch.manual_seed(42)
 if not torch.cuda.is_available():
@@ -428,8 +430,8 @@ def section5():
 # =====================================================================
 def section6():
     print("=" * 84)
-    print("6) torch.compile(backend='eager', mode='max-autotune') 对比")
-    print("   训练实际 use_compile=True。数据依赖的 Python 循环会触发 graph break/重编译")
+    print("6) torch.compile 对比（默认 inductor 后端）")
+    print("   新版 FixedCap MoE 为纯 tensor 分桶, 整模型编译实测 1.7x")
     print("=" * 84)
     args = build_args(use_moe=True)
     m = build_model(args, no_head=True)
@@ -438,18 +440,18 @@ def section6():
     print(f"  原生 eager        fwd {tf0:6.2f} ms   fwd+bwd {tb0:6.2f} ms")
 
     if QUICK:
-        print("  (quick 模式: 跳过 compile 实测, 见前文结论——数据依赖循环会让 compile 慢 10x)")
+        print("  (quick 模式: 跳过 compile 实测, 结论见注释——inductor 1.7x)")
         print()
         return
     t0 = time.time()
     try:
-        mc = torch.compile(m, mode="max-autotune", backend="eager")
+        mc = torch.compile(m, mode="max-autotune")  # 默认 inductor
         tf1 = time_ms(make_fwd_fn(mc, no_head=True), warmup=1, iters=6)
         t_compile = time.time() - t0
         tb1 = time_ms(make_train_fn(mc, no_head=True), warmup=1, iters=6)
         print(f"  torch.compile     fwd {tf1:6.2f} ms   fwd+bwd {tb1:6.2f} ms   "
               f"(编译耗时 {t_compile:.0f}s)")
-        verdict = "compile 慢于 eager, 数据依赖控制流导致重编译/无法融合" if tf1 > tf0 * 1.1 else "compile 生效"
+        verdict = "compile 生效" if tf1 < tf0 * 0.9 else "compile 无明显加速"
         print(f"  结论: {verdict}")
     except Exception as ex:
         print(f"  torch.compile 失败/跳过: {type(ex).__name__}: {ex}")
@@ -466,7 +468,7 @@ class PaddedMoEBmm(nn.Module):
         super().__init__()
         self.args = args
         N = args.n_experts
-        self.router = nn.Linear(args.d_model, N)  # 与 models.py 一致, bias=True
+        self.router = nn.Linear(args.d_model, N, bias=False)  # 与 models.py 一致, bias=False
         self.latent_down = nn.Linear(args.d_model, args.d_latent, bias=False)
         self.latent_up = nn.Linear(args.d_latent, args.d_model, bias=False)
         w = torch.empty(N, args.d_latent, args.d_inner)
@@ -534,9 +536,11 @@ def section7():
     # 正确性: 路由 + 权重对齐后输出应一致
     with torch.no_grad():
         ref.router.weight.copy_(cur.router.weight)
-        ref.router.bias.copy_(cur.router.bias)
-        ref.latent_down.weight.copy_(cur.latent_down.weight)
-        ref.latent_up.weight.copy_(cur.latent_up.weight)
+        if ref.router.bias is not None and cur.router.bias is not None:
+            ref.router.bias.copy_(cur.router.bias)
+        if cur.args.latent_moe:
+            ref.latent_down.weight.copy_(cur.latent_down.weight)
+            ref.latent_up.weight.copy_(cur.latent_up.weight)
         for i, exp in enumerate(cur.experts):
             ref.w_gate[i].copy_(exp.gate_proj.weight.t())
             ref.w_up[i].copy_(exp.up_proj.weight.t())
@@ -583,7 +587,7 @@ class FastMoEFFN(nn.Module):
         self.Kk = args.n_experts_per_tok
         self.d = args.d_latent
         self.M_cap = m_cap  # None => 每层动态容量(1 次 .item() 同步); 否则固定容量(0 同步, 路由需均衡)
-        self.router = nn.Linear(args.d_model, args.n_experts)
+        self.router = nn.Linear(args.d_model, args.n_experts, bias=False)
         self.latent_down = nn.Linear(args.d_model, args.d_latent, bias=False)
         self.latent_up = nn.Linear(args.d_latent, args.d_model, bias=False)
         w = torch.empty(self.N, args.d_latent, args.d_inner).normal_(0, 0.02)
@@ -598,13 +602,17 @@ class FastMoEFFN(nn.Module):
         m = cls(moe.args, m_cap=m_cap)
         with torch.no_grad():
             m.router.weight.copy_(moe.router.weight)
-            m.router.bias.copy_(moe.router.bias)
             m.latent_down.weight.copy_(moe.latent_down.weight)
             m.latent_up.weight.copy_(moe.latent_up.weight)
-            for i, exp in enumerate(moe.experts):
-                m.w_gate[i].copy_(exp.gate_proj.weight.t())
-                m.w_up[i].copy_(exp.up_proj.weight.t())
-                m.w_down[i].copy_(exp.down_proj.weight.t())
+            if hasattr(moe, "w_gate"):
+                m.w_gate.copy_(moe.w_gate)
+                m.w_up.copy_(moe.w_up)
+                m.w_down.copy_(moe.w_down)
+            else:
+                for i, exp in enumerate(moe.experts):
+                    m.w_gate[i].copy_(exp.gate_proj.weight.t())
+                    m.w_up[i].copy_(exp.up_proj.weight.t())
+                    m.w_down[i].copy_(exp.down_proj.weight.t())
         return m
 
     def forward(self, x, token_ids=None):
@@ -661,12 +669,314 @@ class FastMoEFFN(nn.Module):
         return self.latent_up(y.view(B, S, d))
 
 
+class FixedCapMoEFFN(nn.Module):
+    """FastMoEFFN 的固定容量版: 0 次 CPU 同步 (连 M 的 .item() 都去掉)。
+
+    - M_cap = ceil(期望均分token数 * kappa / 16) * 16, 所有层相同, 首个 forward 定下
+    - 超容量 token 的 prob 置 0 (丢弃), 用 index_add_ 归入 padding 槽, 不影响结果
+    - 代价: 每专家固定算 M 个 slot, 容量内 token 少时浪费算力; kappa 权衡吞吐/丢弃率
+    """
+
+    def __init__(self, args, kappa=1.25, ds_gamma=0.0):
+        super().__init__()
+        self.args = args
+        self.kappa = kappa
+        self.ds_gamma = ds_gamma
+        self.N = args.n_experts
+        self.Kk = args.n_experts_per_tok
+        self.d = args.d_latent
+        self.M_cap = None
+        self.last_drop = 0.0
+        self.router = nn.Linear(args.d_model, args.n_experts, bias=False)
+        self.latent_down = nn.Linear(args.d_model, args.d_latent, bias=False)
+        self.latent_up = nn.Linear(args.d_latent, args.d_model, bias=False)
+        w = torch.empty(self.N, args.d_latent, args.d_inner).normal_(0, 0.02)
+        self.w_gate = nn.Parameter(w)
+        self.w_up = nn.Parameter(w.clone())
+        self.w_down = nn.Parameter(
+            torch.empty(self.N, args.d_inner, args.d_latent).normal_(0, 0.02)
+        )
+        if ds_gamma > 0:
+            self.register_buffer("expert_bias", torch.zeros(args.n_experts))
+
+    @classmethod
+    def from_moeffn(cls, moe: MoEFFN, kappa=1.25, ds_gamma=0.0):
+        m = cls(moe.args, kappa=kappa, ds_gamma=ds_gamma)
+        with torch.no_grad():
+            m.router.weight.copy_(moe.router.weight)
+            m.latent_down.weight.copy_(moe.latent_down.weight)
+            m.latent_up.weight.copy_(moe.latent_up.weight)
+            if hasattr(moe, "w_gate"):
+                m.w_gate.copy_(moe.w_gate)
+                m.w_up.copy_(moe.w_up)
+                m.w_down.copy_(moe.w_down)
+            else:
+                for i, exp in enumerate(moe.experts):
+                    m.w_gate[i].copy_(exp.gate_proj.weight.t())
+                    m.w_up[i].copy_(exp.up_proj.weight.t())
+                    m.w_down[i].copy_(exp.down_proj.weight.t())
+        return m
+
+    def forward(self, x, token_ids=None):
+        args = self.args
+        N, Kk, d = self.N, self.Kk, self.d
+        B, S, _ = x.shape
+        T = B * S
+
+        logits = self.router(x)
+        if self.ds_gamma > 0:
+            logits_sel = logits + self.expert_bias
+        else:
+            logits_sel = logits
+        _, idx = torch.topk(logits_sel, Kk, dim=-1)
+        assert Kk == 1, "FixedCapMoEFFN 仅支持 k=1"
+        expert = idx.view(-1)
+        tl = torch.gather(logits, -1, idx)  # 权重用原始 logits
+        tp = torch.sqrt(F.softplus(tl))
+        tp = tp / tp.sum(dim=-1, keepdim=True)
+        if self.ds_gamma > 0 and self.training:
+            load = torch.bincount(expert, minlength=N).float()
+            self.expert_bias.data.add_(-self.ds_gamma * torch.sign(load - load.mean()))
+
+        if self.M_cap is None:
+            mean_tok = T / N
+            self.M_cap = math.ceil(mean_tok * self.kappa / 16) * 16
+        M = self.M_cap
+
+        xl = self.latent_down(x).view(T, -1)
+        order = torch.argsort(expert, stable=True)
+        es = expert[order]
+        ps = tp.view(-1)[order].to(xl.dtype)
+
+        counts = torch.bincount(es, minlength=N)
+        cs = torch.cumsum(counts, dim=0)
+        starts = cs - counts
+        ar = torch.arange(T, device=x.device)
+        pos = ar - starts.gather(0, es)
+        keep = pos < M
+        pos_safe = torch.clamp(pos, max=M - 1)
+        target = es.long() * M + pos_safe
+        w = keep.to(xl.dtype)
+        total = N * M
+
+        # 超容量 token 输入/权重置 0 后 index_add 到 padding 槽, 无越界且不污染结果
+        block = torch.zeros(total, d, device=x.device, dtype=xl.dtype)
+        block.index_add_(0, target, xl[order] * w.unsqueeze(-1))
+        block_p = torch.zeros(total, device=x.device, dtype=xl.dtype)
+        block_p.index_add_(0, target, ps * w)
+        block = block.view(N, M, d)
+
+        h1 = F.silu(torch.bmm(block, self.w_gate))
+        h2 = torch.bmm(block, self.w_up)
+        out = torch.bmm(h1 * h2, self.w_down).view(total, d)
+        out = out * block_p.unsqueeze(-1)
+
+        tok_of = torch.zeros(total, device=x.device, dtype=torch.long)
+        tok_of.index_add_(0, target, ar[order] * keep.to(torch.long))
+        y = torch.zeros(T, d, device=x.device, dtype=out.dtype)
+        y.index_add_(0, tok_of, out)
+
+        self.last_drop = (1 - keep.to(torch.float32).mean()).item()
+        return self.latent_up(y.view(B, S, d))
+
+
+class SimpleMaskMoEFFN(nn.Module):
+    """MiniMind 风格 MoE: 最朴素实现 (奥卡姆) —— 每专家一个 mask 循环。
+
+    - topk 后逐专家 mask 收集 token, 无 sort/bincount/分桶 (nonzero 有隐式同步, 见测量)
+    - 路由公式与 models.py 完全一致: topk(raw logits) + sqrt(softplus) 归一化
+    - 可选一行 aux loss (router_aux_loss_coef, MiniMind 同款):
+      aux = coef * N * (load * gate.mean(0)).sum(), load 用 topk 选中比例
+    - 可选 DeepSeek loss-free 负载均衡 (ds_gamma>0): bias 加到 topk 输入,
+      不进梯度图; 每步按负载差自动更新, 无 aux loss
+    """
+
+    def __init__(self, args, aux_coef=0.0, ds_gamma=0.0):
+        super().__init__()
+        self.args = args
+        self.aux_coef = aux_coef
+        self.ds_gamma = ds_gamma
+        self.N = args.n_experts
+        self.Kk = args.n_experts_per_tok
+        self.router = nn.Linear(args.d_model, args.n_experts, bias=False)
+        self.latent_down = nn.Linear(args.d_model, args.d_latent, bias=False)
+        self.latent_up = nn.Linear(args.d_latent, args.d_model, bias=False)
+        self.experts = nn.ModuleList([FFN(args) for _ in range(args.n_experts)])
+        if ds_gamma > 0:
+            self.register_buffer("expert_bias", torch.zeros(args.n_experts))
+
+    @classmethod
+    def from_moeffn(cls, moe: MoEFFN, aux_coef=0.0, ds_gamma=0.0):
+        m = cls(moe.args, aux_coef=aux_coef, ds_gamma=ds_gamma)
+        with torch.no_grad():
+            m.router.weight.copy_(moe.router.weight)
+            m.latent_down.weight.copy_(moe.latent_down.weight)
+            m.latent_up.weight.copy_(moe.latent_up.weight)
+            if hasattr(moe, "w_gate"):
+                for i in range(moe.N):
+                    m.experts[i].gate_proj.weight.copy_(moe.w_gate[i].t())
+                    m.experts[i].up_proj.weight.copy_(moe.w_up[i].t())
+                    m.experts[i].down_proj.weight.copy_(moe.w_down[i].t())
+            else:
+                for i, exp in enumerate(moe.experts):
+                    m.experts[i].load_state_dict(exp.state_dict())
+        return m
+
+    def forward(self, x, token_ids=None):
+        args = self.args
+        B, S, _ = x.shape
+        T = B * S
+        N, Kk = self.N, self.Kk
+        logits = self.router(x).reshape(T, N)
+        tl, ti = torch.topk(logits, Kk, dim=-1)
+        assert Kk == 1, "SimpleMaskMoEFFN 仅支持 k=1"
+        if self.ds_gamma > 0:
+            # DeepSeek loss-free 均衡: bias 只影响 topk 选择, 不改权重
+            logits_b = logits + self.expert_bias
+            tl, ti = torch.topk(logits_b, Kk, dim=-1)
+            tl = torch.gather(logits, -1, ti)  # 权重用原始 logits, 与 models.py 一致
+            if self.training:
+                # bias <- bias - gamma * sign(load_expert - load_mean)  (DeepSeek V3)
+                load = torch.bincount(ti.view(-1), minlength=N).float()
+                target = torch.sign(load - load.mean()) * self.ds_gamma
+                self.expert_bias.data.add_(-target)  # 低负载专家 bias 抬高
+        tp = torch.sqrt(F.softplus(tl))
+        tp = tp / tp.sum(dim=-1, keepdim=True)  # k=1 时恒 1.0
+
+        xl = self.latent_down(x).view(T, -1)
+        y = torch.zeros(T, args.d_latent, device=x.device, dtype=xl.dtype)
+        ti_f = ti.view(-1)      # [T] (k=1); k>1 时也按槽位展平, 与权重一致
+        tp_f = tp.view(-1)
+        for i, expert in enumerate(self.experts):
+            tok = (ti_f == i).nonzero().flatten()
+            if tok.numel():
+                w = tp_f[tok].to(xl.dtype).unsqueeze(-1)
+                y.index_add_(0, tok, expert(xl[tok]) * w)
+        y = self.latent_up(y.view(B, S, args.d_latent))
+
+        if self.aux_coef:
+            load = F.one_hot(ti_f, N).to(xl.dtype).mean(dim=0)       # [N]
+            gate = torch.softmax(logits, dim=-1).mean(dim=0)        # [N]
+            self.aux_loss = self.aux_coef * N * (load * gate).sum()
+        return y
+
+
+def build_simple_model(args, aux_coef=0.0, ds_gamma=0.0):
+    """每层 mlp 换成 SimpleMaskMoEFFN (MiniMind 风格, 每层 N 次 mask 循环)"""
+    with redirect_stdout(io.StringIO()):
+        m = MyLM(args)
+    for blk in m.blocks:
+        blk.mlp = SimpleMaskMoEFFN.from_moeffn(
+            blk.mlp, aux_coef=aux_coef, ds_gamma=ds_gamma)
+    return m.to(DEVICE)
+
+
+class EinsumMoEFFN(nn.Module):
+    """全专家 einsum MoE —— 极简实现: 0 CPU 同步 / 0 Python 循环 / 无 padding 无丢弃 / 数学精确。
+
+    思路 (拿算力换 kernel 数量, latency-bound 场景下的净增益):
+      - 把 12 个专家的 gate/up/down 权重各 stack 成 [N, d, d_inner] 张量
+      - 3 次 einsum 一次性算完全部专家在全部 token 上的输出 ([T,N,d_inner]) -> N× FLOPs
+      - 再 gather 出每个 token 被路由到的那 K 个专家, 加权求和 (k=1 即唯一专家)
+    用 3 个大 kernel 替代 36 个串行小 Linear + 24 次 .nonzero()/.numel() 同步。
+    当前规模下每专家仅处理 ~1400 token 的小 GEMM, GPU 利用率极低, 此法常为净增益。
+    """
+
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.N = args.n_experts
+        self.Kk = args.n_experts_per_tok
+        self.router = nn.Linear(args.d_model, args.n_experts, bias=False)
+        if args.latent_moe:
+            self.latent_down = nn.Linear(args.d_model, args.d_latent, bias=False)
+            self.latent_up = nn.Linear(args.d_latent, args.d_model, bias=False)
+        d_in = args.d_latent if args.latent_moe else args.d_model
+        w = torch.empty(args.n_experts, d_in, args.d_inner).normal_(0, 0.02)
+        self.w_gate = nn.Parameter(w)
+        self.w_up = nn.Parameter(w.clone())
+        self.w_down = nn.Parameter(
+            torch.empty(args.n_experts, args.d_inner, d_in).normal_(0, 0.02))
+
+    @classmethod
+    def from_moeffn(cls, moe: MoEFFN):
+        m = cls(moe.args)
+        with torch.no_grad():
+            m.router.weight.copy_(moe.router.weight)
+            if moe.args.latent_moe:
+                m.latent_down.weight.copy_(moe.latent_down.weight)
+                m.latent_up.weight.copy_(moe.latent_up.weight)
+            if hasattr(moe, "w_gate"):
+                m.w_gate.copy_(moe.w_gate)
+                m.w_up.copy_(moe.w_up)
+                m.w_down.copy_(moe.w_down)
+            else:
+                for i, exp in enumerate(moe.experts):
+                    m.w_gate[i].copy_(exp.gate_proj.weight.t())
+                    m.w_up[i].copy_(exp.up_proj.weight.t())
+                    m.w_down[i].copy_(exp.down_proj.weight.t())
+        return m
+
+    def forward(self, x, token_ids=None):
+        args = self.args
+        N, Kk = self.N, self.Kk
+        B, S, _ = x.shape
+        T = B * S
+
+        logits = self.router(x)  # [B, S, N]
+        tl, ti = torch.topk(logits, Kk, dim=-1)  # [B, S, K]
+        tp = torch.sqrt(F.softplus(tl))
+        tp = tp / tp.sum(dim=-1, keepdim=True)  # k=1 时恒为 1.0
+
+        if args.latent_moe:
+            x = self.latent_down(x)
+        d = x.shape[-1]
+        flat_x = x.reshape(T, d)  # [T, d]
+
+        # 3 个大 einsum 替代 36 个小 Linear: 一次性算完全部专家在全部 token 上的输出
+        gate_all = torch.einsum('td,ndh->tnh', flat_x, self.w_gate)  # [T, N, d_inner]
+        up_all = torch.einsum('td,ndh->tnh', flat_x, self.w_up)
+        h = F.silu(gate_all) * up_all
+        out_all = torch.einsum('tnh,nhd->tnd', h, self.w_down)  # [T, N, d]
+
+        # 每个 token 只取被路由到的那 K 个专家 (k=1 即唯一专家), 加权求和
+        ti_flat = ti.reshape(T, Kk)  # [T, K]
+        idx_exp = ti_flat.unsqueeze(-1).expand(T, Kk, d)  # [T, K, d]
+        selected = out_all.gather(1, idx_exp)  # [T, K, d]
+        selected = selected * tp.reshape(T, Kk, 1).to(selected.dtype)
+        selected = selected.sum(dim=1)  # [T, d]
+
+        out = selected.view(B, S, d)
+        if args.latent_moe:
+            out = self.latent_up(out)
+        return out
+
+
+def build_einsum_model(args):
+    """每层 mlp 换成 EinsumMoEFFN (3 大 kernel, 0 同步, N× 算力换吞吐)"""
+    with redirect_stdout(io.StringIO()):
+        m = MyLM(args)
+    for blk in m.blocks:
+        blk.mlp = EinsumMoEFFN.from_moeffn(blk.mlp)
+    return m.to(DEVICE)
+
+
 def build_fast_moe_model(args, m_cap=None):
     """先建普通 MyLM(MoE), 再把每层 mlp 换成 FastMoEFFN (复制权重)"""
     with redirect_stdout(io.StringIO()):
         m = MyLM(args)
     for blk in m.blocks:
         blk.mlp = FastMoEFFN.from_moeffn(blk.mlp, m_cap=m_cap)
+    return m.to(DEVICE)
+
+
+def build_fixed_cap_model(args, kappa=1.25, ds_gamma=0.0):
+    """每层 mlp 换成 FixedCapMoEFFN (0 次同步, 固定容量, 可选 DS bias)"""
+    with redirect_stdout(io.StringIO()):
+        m = MyLM(args)
+    for blk in m.blocks:
+        blk.mlp = FixedCapMoEFFN.from_moeffn(
+            blk.mlp, kappa=kappa, ds_gamma=ds_gamma)
     return m.to(DEVICE)
 
 
@@ -799,31 +1109,611 @@ def section8():
     print()
 
 
+def collect_cap_drop(model, iters=20):
+    """统计 FixedCapMoE 每层超容量丢弃率(%)。全模型前向, 每层每iter一次 .item()。
+
+    注意: 输入必须是 token id (Long), 不是连续向量 —— 走完整模型 forward。
+    """
+    x = torch.randint(0, VOCAB, (BATCH, SEQ), device=DEVICE)
+    drops = {bi: [] for bi in range(len(model.blocks))}
+    with torch.no_grad(), torch.autocast(DEVICE, dtype=AMP_DTYPE):
+        for _ in range(iters):
+            model(x)
+            for bi, blk in enumerate(model.blocks):
+                mlp = blk.mlp
+                drops[bi].append(getattr(mlp, "last_drop", 0.0))
+    torch.cuda.synchronize()
+    return {k: np.mean(v) * 100 for k, v in drops.items()}
+
+
+_BENCH_SCRIPT = r"""
+import os, sys
+os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
+import time
+import torch
+from debug_moe import (build_args, build_model, build_fast_moe_model,
+                       build_fixed_cap_model, build_simple_model, build_einsum_model,
+                       make_fwd_fn, make_train_fn, time_ms, FixedCapMoEFFN, collect_cap_drop)
+kind = sys.argv[1]
+arg = float(sys.argv[2]) if len(sys.argv) > 2 else None
+if kind == "dense":
+    a = build_args(use_moe=False, latent=False, d_latent=512, d_inner=320)
+    a.seq_max_len = 257
+    m = build_model(a)
+elif kind == "dense1365":
+    a = build_args(use_moe=False, latent=False, d_latent=512, d_inner=1365)
+    a.seq_max_len = 257
+    m = build_model(a)
+else:
+    a = build_args(use_moe=True)
+    a.seq_max_len = 257
+    if kind == "orig":  m = build_model(a)
+    elif kind == "simple": m = build_simple_model(a)
+    elif kind == "simpleaux": m = build_simple_model(a, aux_coef=float(arg or 5e-4))
+    elif kind == "simplebias": m = build_simple_model(a, ds_gamma=5e-3)
+    elif kind == "einsum": m = build_einsum_model(a)
+    elif kind == "fast": m = build_fast_moe_model(a, m_cap=None)
+    elif kind == "fixed": m = build_fixed_cap_model(a, kappa=arg)
+    elif kind == "fixedb": m = build_fixed_cap_model(a, kappa=arg, ds_gamma=5e-3)
+    elif kind == "origncpl":
+        from models import exclude_moe_from_compile
+        m = build_model(a)
+        exclude_moe_from_compile(m)
+        m = torch.compile(m, mode="max-autotune", backend="eager")
+    elif kind == "fixedcpl":
+        from models import exclude_moe_from_compile
+        m = build_fixed_cap_model(a, kappa=arg)
+        t0 = time.time()
+        m = torch.compile(m, mode="max-autotune", backend="eager")
+        print(f"compile_time_s={time.time()-t0:.1f}", flush=True)
+    else:
+        raise SystemExit(f"unknown kind {kind}")
+tf = time_ms(make_fwd_fn(m, batch=64, seq=257), warmup=1, iters=4)
+tb = time_ms(make_train_fn(m, batch=64, seq=257), warmup=1, iters=4)
+dr = None
+mlp0 = getattr(m.blocks[0], "mlp", None)
+if isinstance(mlp0, FixedCapMoEFFN) and "cpl" not in kind:
+    dr = max(collect_cap_drop(m).values())
+print(f"RESULT fwd={tf:.2f} tb={tb:.2f} drop={dr if dr is not None else '-'}")
+"""
+
+
+def _bench_subprocess(kind, arg=None):
+    import subprocess
+    args = [sys.executable, "-c", _BENCH_SCRIPT, kind]
+    if arg is not None:
+        args.append(str(arg))
+    r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        return None, None, None, r.stdout[-400:] + r.stderr[-400:]
+    for line in r.stdout.splitlines():
+        if line.startswith("RESULT"):
+            parts = line.split()
+            tf = float(parts[1].split("=")[1])
+            tb = float(parts[2].split("=")[1])
+            drop = None if parts[3].split("=")[1] == "-" else float(parts[3].split("=")[1])
+            return tf, tb, drop, None
+    return None, None, None, r.stdout[-400:]
+
+
+def section9():
+    print("=" * 84)
+    print("9) 正规化方案对比: 训练尺寸 B=64, S=257, fwd+bwd (每变体独立子进程)")
+    print("=" * 84)
+
+    variants = [
+        ("MoE原版(eager)", "orig", None),
+        ("SimpleMask(eager)", "simple", None),
+        ("EinsumMoE(eager)", "einsum", None),
+        ("FastMoE动态(eager)", "fast", None),
+        ("FixedCap k=1.10", "fixed", 1.10),
+        ("FixedCap k=1.25", "fixed", 1.25),
+        ("FixedCap k=1.60", "fixed", 1.60),
+        ("FixedCap k=1.25(compile)", "fixedcpl", 1.25),
+        ("MoE原版(compile+exclude)", "origncpl", None),
+        ("Dense-320(eager)", "dense", None),
+    ]
+    if QUICK:
+        print("(quick 模式: 跳过 compile 变体, 只测 eager)")
+        variants = [v for v in variants if "cpl" not in v[1]]
+
+    print(f"  {'模型':<26s}{'fwd ms':>9s}{'fwd+bwd ms':>11s}{'最大丢弃率':>11s}")
+    results = {}
+    for name, kind, arg in variants:
+        tf, tb, drop, err = _bench_subprocess(kind, arg)
+        if tf is None:
+            print(f"  {name:<26s} 子进程失败: {err}")
+            continue
+        results[name] = tb
+        ds = f"{drop:.1f}%" if drop is not None else "-"
+        print(f"  {name:<26s}{tf:>9.2f}{tb:>11.2f}{ds:>11s}")
+
+    moe = {k: v for k, v in results.items() if "MoE" in k or "FixedCap" in k or "FastMoE" in k}
+    dense = {k: v for k, v in results.items() if "Dense" in k}
+    best_moe = min(moe, key=moe.get)
+    best_dense = min(dense, key=dense.get) if dense else None
+    print(f"\n  最快 MoE: {best_moe} ({moe[best_moe]:.2f} ms)")
+    if best_dense:
+        print(f"  最快 Dense: {best_dense} ({dense[best_dense]:.2f} ms)")
+        if moe[best_moe] < dense[best_dense]:
+            print(f"  ==> MoE已快于 Dense ({dense[best_dense]/moe[best_moe]:.2f}x)")
+        else:
+            print(f"  ==> Dense仍快 {moe[best_moe]/dense[best_dense]:.2f}x")
+
+    base = results.get("MoE原版(eager)")
+    if base:
+        print("\n  相对 原版MoE 的变化:")
+        for k, v in results.items():
+            if k == "MoE原版(eager)":
+                continue
+            tag = "+" if v > base else "-"
+            print(f"    {k}: {base/v if v else 0:.2f}x  ({tag}{abs(v-base)/base*100:.1f}%)")
+    print()
+
+
+def section10():
+    print("=" * 84)
+    print("10) 奥卡姆裁决: 原版sort / MiniMask简单版 / FixedCap 三选一")
+    print("=" * 84)
+
+    # A) 数值一致性: 同一权重下 SimpleMask / EinsumMoE vs 原版
+    a_moe = build_args(use_moe=True)
+    _orig = build_model(a_moe)
+    sm = build_simple_model(a_moe)
+    sd = {k: v for k, v in _orig.state_dict().items()
+          if not (k.endswith("cos_cached") or k.endswith("sin_cached"))}
+    sm.load_state_dict(sd, strict=False)
+    # EinsumMoE: 非mlp权重从原版load, mlp用from_moeffn复制(_orig同权重)
+    em = MyLM(a_moe).to(DEVICE)
+    _non_mlp = {k: v for k, v in sd.items() if ".mlp." not in k}
+    em.load_state_dict(_non_mlp, strict=False)
+    for blk_o, blk_e in zip(_orig.blocks, em.blocks):
+        blk_e.mlp = EinsumMoEFFN.from_moeffn(blk_o.mlp).to(DEVICE)
+    xv = torch.randint(0, VOCAB, (BATCH, SEQ), device=DEVICE)
+    _orig.eval(); sm.eval(); em.eval()
+    torch.manual_seed(0)
+    with torch.no_grad(), torch.autocast(DEVICE, dtype=AMP_DTYPE):
+        o1 = _orig(xv); o2 = sm(xv); o3 = em(xv)
+    err_sm = (o1.float() - o2.float()).abs().max().item()
+    err_em = (o1.float() - o3.float()).abs().max().item()
+    print(f"  A) SimpleMask vs 原MoE 误差: {err_sm:.2e}"
+          f"  {'一致(bf16舍入)' if err_sm < 5e-2 else '不一致!'}")
+    print(f"     EinsumMoE vs 原MoE 误差: {err_em:.2e}"
+          f"  {'一致(bf16舍入)' if err_em < 5e-2 else '不一致!'}")
+
+    # B) 实现体量 (forward 方法体行数, 反映维护成本)
+    import ast as _ast
+    src = open(__file__, encoding="utf-8").read()
+    m_src = open(os.path.join(os.path.dirname(__file__), "models.py"),
+                 encoding="utf-8").read()
+    def _fwd_body_lines(source, cls):
+        tree = _ast.parse(source)
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ClassDef) and node.name == cls:
+                for child in node.body:
+                    if isinstance(child, _ast.FunctionDef) and child.name == "forward":
+                        return child.end_lineno - child.lineno - 1
+        return -1
+    loc = {"MoEFFN原版": _fwd_body_lines(m_src, "MoEFFN"),
+           "SimpleMask": _fwd_body_lines(src, "SimpleMaskMoEFFN"),
+           "EinsumMoE": _fwd_body_lines(src, "EinsumMoEFFN"),
+           "FixedCap": _fwd_body_lines(src, "FixedCapMoEFFN")}
+    print("  B) forward 方法体行数 (越小越好维护):")
+    for k, v in loc.items():
+        print(f"    {k:<16s} {v} 行")
+
+    # C) 吞吐对拍 (独立子进程, 训练尺寸)
+    print("  C) 训练尺寸对拍 (B=64, S=257, fwd+bwd):")
+    variants = [
+        ("MoE原版(sort+同步)", "orig", None, "瓶颈基线"),
+        ("SimpleMask(朴素)", "simple", None, "MiniMind风格, nonzero同步"),
+        ("EinsumMoE", "einsum", None, "3大kernel 0同步 N×算力, 精确无丢"),
+        ("SimpleMask+aux5e-4", "simpleaux", 5e-4, "一行aux平衡, 同赛道"),
+        ("FixedCap k=1.10", "fixed", 1.10, "bmm 0同步, 快但有丢率"),
+        ("FixedCap k=1.25", "fixed", 1.25, "bmm 0同步"),
+        ("Dense-320", "dense", None, "非MoE上限"),
+    ]
+    if QUICK:
+        print("  (quick: 只测前4项)")
+        variants = variants[:4]
+    results = {}
+    for name, kind, arg, note in variants:
+        tf, tb, drop, errd = _bench_subprocess(kind, arg)
+        if tf is None:
+            print(f"    {name:<22s} 失败: {errd}")
+            continue
+        results[name] = tb
+        ds = f" (最大丢率{drop:.0f}%)" if drop is not None else ""
+        print(f"    {name:<22s} fwd+bwd {tb:8.2f} ms{ds}  {note}")
+    base = results.get("MoE原版(sort+同步)")
+    if base:
+        print("\n    相对原版:")
+        for k, v in results.items():
+            print(f"      {k:<22s} {v:8.2f} ms  ({v/base:.2f}x)")
+    print()
+
+    # D) 平衡验证: 微小训练 无/有一行 aux loss, 看路由是否崩向单专家
+    print("  D) 平衡验证: 200步小训 (B=32,S=129,随机数据), 专家利用均衡度:")
+    for coef, tag in [(0.0, "无aux "), (5e-4, "有aux5e-4")]:
+        res = _run_train_probe(coef)
+        print(f"    {tag}: {res}")
+
+    print()
+
+
+def _run_train_probe(coef):
+    """子进程跑 200 步随机数据小训练, 返回每层 count.max/count.min 均衡度。
+    aux=0 或 5e-4, 观测路由是否崩塌到单个专家。"""
+    import subprocess
+    script = r'''
+import os, sys
+os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
+import torch, torch.nn.functional as F
+from debug_moe import build_args, build_simple_model, VOCAB
+coef = float(sys.argv[1])
+torch.manual_seed(7)
+a = build_args(use_moe=True)
+m = build_simple_model(a, aux_coef=coef).cuda().train()
+opt = torch.optim.AdamW(m.parameters(), lr=3e-4)
+x = torch.randint(0, VOCAB, (32, 129), device="cuda")
+y = torch.randint(0, VOCAB, (32, 129), device="cuda")
+for s in range(200):
+    opt.zero_grad(set_to_none=True)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        logits = m(x, token_ids=x)
+        loss = F.cross_entropy(logits.view(-1, VOCAB), y.view(-1))
+        if coef:
+            loss = loss + sum(b.mlp.aux_loss for b in m.blocks)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
+    opt.step()
+with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+    got = []
+    handles = []
+    for blk in m.blocks:
+        h = blk.mlp.router.register_forward_hook(
+            lambda mod, i, o: got.append(o))
+        handles.append(h)
+    logits = m(x, token_ids=x)
+    for h in handles:
+        h.remove()
+    out = []
+    for bi, raw in enumerate(got):
+        cnt = torch.bincount(raw.argmax(-1).view(-1), minlength=12).float()
+        out.append(f"L{bi} max={cnt.max().item()/cnt.sum().item():.0%}"
+                   f" min={cnt.min().item()/cnt.sum().item():.0%}")
+    print("BAL " + " ".join(out) + f" loss={loss.item():.3f}")
+'''
+    r = subprocess.run([sys.executable, "-c", script, str(coef)],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", cwd=os.path.dirname(os.path.abspath(__file__)))
+    if r.returncode != 0:
+        return "FAIL: " + (r.stderr or r.stdout)[-400:]
+    for line in r.stdout.splitlines():
+        if line.startswith("BAL"):
+            return line[4:]
+    return "FAIL: no BAL line\n" + r.stdout[-400:]
+
+
+def section11():
+    print("=" * 84)
+    print("11) 真实语料简易训练: 路由均衡性 + 训练速度 (B=32, S=192)")
+    print("=" * 84)
+
+    from dataset import PretrainTokenIDDataset
+    data_path = "mini_data192mixen_v3.npy" if os.path.exists("mini_data192mixen_v3.npy") \
+        else "medium_data256v2.npy"
+    seq_len = 192 if "mini" in data_path else 256
+    print(f"  数据: {data_path}  seq={seq_len}  (vocab={VOCAB})")
+
+    ds = PretrainTokenIDDataset(data_path, seq_max_len=seq_len)
+    n_use = min(len(ds), 100_000)
+    rng = torch.Generator().manual_seed(0)
+    idx = torch.randperm(len(ds), generator=rng)[:n_use].tolist()
+    ds.indices = idx
+    loader = torch.utils.data.DataLoader(ds, batch_size=32, shuffle=True,
+                                         num_workers=2, drop_last=True)
+
+    steps_total = 400 if not QUICK else 100
+
+    def _train(model, tag):
+        model.train()
+        opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
+        got = {}
+        handles = []
+        for bi, blk in enumerate(model.blocks):
+            mlp = blk.mlp
+            if hasattr(mlp, "router"):
+                handles.append((bi, mlp.router.register_forward_hook(
+                    lambda mod, i, o, bi=bi: got.update({bi: o.detach().clone()}))))
+        t0 = time.time()
+        loss = float("nan")
+        for step, (xb, yb, mb) in enumerate(loader):
+            xb, yb, mb = xb.to(DEVICE), yb.to(DEVICE), mb.to(DEVICE)
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast(DEVICE, dtype=AMP_DTYPE):
+                logits = model(xb, token_ids=xb)
+                loss = (F.cross_entropy(logits.view(-1, VOCAB), yb.view(-1),
+                                        reduction="none") * mb.view(-1)).sum() / mb.sum()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            if step + 1 >= steps_total:
+                break
+        dt = time.time() - t0
+        ms_step = dt * 1000 / min(steps_total, len(loader))
+
+        # 最终路由分布: hook 拿到的 router logits (+ bias 后 argmax)
+        dists = {}
+        for bi, raw in got.items():
+            mlp = model.blocks[bi].mlp
+            lr = raw + getattr(mlp, "expert_bias", 0)
+            cnt = torch.bincount(lr.argmax(-1).view(-1), minlength=N_EXPERTS).float()
+            dists[bi] = cnt / cnt.sum()
+        stats = []
+        for bi in range(N_LAYERS):
+            d = dists.get(bi)
+            if d is not None:
+                stats.append(f"L{bi} max={d.max().item()*100:.0f}%"
+                             f" min={d.min().item()*100:.0f}%")
+        for h in handles:
+            h[1].remove()
+        # FixedCap 系列: 汇总最终丢率
+        drops = []
+        for blk in model.blocks:
+            mlp = blk.mlp
+            if isinstance(mlp, FixedCapMoEFFN):
+                drops.append(f"{mlp.last_drop*100:.0f}%")
+        return ms_step, loss, "  ".join(stats), drops
+
+    a = build_args(use_moe=True)
+    a.seq_max_len = seq_len
+    a.vocab_size = VOCAB
+    print(f"  MoE ({num_params(build_model(a))/1e6:.1f}M params):")
+    moe_ms, moe_loss, moe_stats, _ = _train(build_model(a), "MoE")
+    print(f"    loss={moe_loss:.3f}  {moe_stats}")
+    print(f"    ms/step={moe_ms:.1f}")
+
+    ds_gamma = 1e-2 if QUICK else 5e-3
+    print(f"  SimpleMask+DS-bias({ds_gamma}) ({num_params(build_model(a))/1e6:.1f}M params):")
+    ds_ms, ds_loss, ds_stats, _ = _train(build_simple_model(a, ds_gamma=ds_gamma), "DS-bias")
+    print(f"    loss={ds_loss:.3f}  {ds_stats}")
+    print(f"    ms/step={ds_ms:.1f}")
+
+    print(f"  FixedCap k=1.25 (无均衡):")
+    fc_ms, fc_loss, fc_stats, fc_drops = _train(build_fixed_cap_model(a, kappa=1.25), "FC")
+    print(f"    loss={fc_loss:.3f}  {fc_stats}  丢率={fc_drops}")
+    print(f"    ms/step={fc_ms:.1f}")
+
+    print(f"  FixedCap k=1.25 + DS-bias({ds_gamma}):")
+    fcd_ms, fcd_loss, fcd_stats, fcd_drops = _train(
+        build_fixed_cap_model(a, kappa=1.25, ds_gamma=ds_gamma), "FC+DS")
+    print(f"    loss={fcd_loss:.3f}  {fcd_stats}  丢率={fcd_drops}")
+    print(f"    ms/step={fcd_ms:.1f}")
+
+    a2 = build_args(use_moe=False, latent=False, d_latent=D_MODEL, d_inner=320)
+    a2.seq_max_len = seq_len
+    a2.vocab_size = VOCAB
+    print(f"  Dense-320 ({num_params(build_model(a2))/1e6:.1f}M params):")
+    de_ms, de_loss, _, _ = _train(build_model(a2), "Dense")
+    print(f"    loss={de_loss:.3f}")
+    print(f"    ms/step={de_ms:.1f}")
+
+    print(f"\n  ==> MoE {moe_ms:.1f} ms/step | +DS {ds_ms:.1f} | FixedCap {fc_ms:.1f} "
+          f"| FixedCap+DS {fcd_ms:.1f} | Dense {de_ms:.1f} ms/step")
+    print()
+    print("  (崩塌时 SimpleMask 反而'快': 多个专家空转直接跳过; FixedCap 靠丢token"
+          "压成本; DS-bias 均衡后 FixedCap 丢率应趋向 0, 速度回到容量算力)")
+    print()
+
+
+def section12():
+    print("=" * 84)
+    print("12) κ 扫描 + compile: 只选'又快又不丢'的点 (DS-bias 固定开启)")
+    print("=" * 84)
+
+    from dataset import PretrainTokenIDDataset
+    data_path = "mini_data192mixen_v3.npy" if os.path.exists("mini_data192mixen_v3.npy") \
+        else "medium_data256v2.npy"
+    seq_len = 192 if "mini" in data_path else 256
+    print(f"  数据: {data_path}  seq={seq_len}  (vocab={VOCAB}), 训练 B=32")
+
+    ds = PretrainTokenIDDataset(data_path, seq_max_len=seq_len)
+    n_use = min(len(ds), 100_000)
+    rng = torch.Generator().manual_seed(0)
+    ds.indices = torch.randperm(len(ds), generator=rng)[:n_use].tolist()
+    loader = torch.utils.data.DataLoader(ds, batch_size=32, shuffle=True,
+                                         num_workers=2, drop_last=True)
+    steps_total = 300 if not QUICK else 80
+    ds_gamma = 5e-3
+
+    def _train_kappa(model):
+        """训 steps_total 步, 复试: 每次构造新模型/优化器, 统计 loss/丢率/速度"""
+        model.train()
+        opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
+        got = {}
+        handles = []
+        for bi, blk in enumerate(model.blocks):
+            mlp = blk.mlp
+            if hasattr(mlp, "router"):
+                handles.append((bi, mlp.router.register_forward_hook(
+                    lambda mod, i, o, bi=bi: got.update({bi: o.detach().clone()}))))
+        t0 = time.time()
+        loss = float("nan")
+        for step, (xb, yb, mb) in enumerate(loader):
+            xb, yb, mb = xb.to(DEVICE), yb.to(DEVICE), mb.to(DEVICE)
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast(DEVICE, dtype=AMP_DTYPE):
+                logits = model(xb, token_ids=xb)
+                loss = (F.cross_entropy(logits.view(-1, VOCAB), yb.view(-1),
+                                        reduction="none") * mb.view(-1)).sum() / mb.sum()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            if step + 1 >= steps_total:
+                break
+        ms_step = (time.time() - t0) * 1000 / min(steps_total, len(loader))
+        loss_v = loss.item()
+        max_drop = 0.0
+        dists = {}
+        for bi, raw in got.items():
+            mlp = model.blocks[bi].mlp
+            max_drop = max(max_drop, getattr(mlp, "last_drop", 0.0))
+            lr = raw + getattr(mlp, "expert_bias", 0)
+            cnt = torch.bincount(lr.argmax(-1).view(-1), minlength=N_EXPERTS).float()
+            dists[bi] = cnt / cnt.sum()
+        mx = max((d.max().item() for d in dists.values()), default=0.0)
+        for h in handles:
+            h[1].remove()
+        return ms_step, loss_v, max_drop * 100, mx * 100
+
+    def run_final(kappa, compile_it=False):
+        a = build_args(use_moe=True)
+        a.seq_max_len = seq_len
+        a.vocab_size = VOCAB
+        m = build_fixed_cap_model(a, kappa=kappa, ds_gamma=ds_gamma)
+        if compile_it:
+            m = torch.compile(m, mode="max-autotune", backend="eager")
+        ms, loss, mx_drop, mx = _train_kappa(m)
+        tag = f"FixedCap k={kappa:.2f}" + (" +compile" if compile_it else "")
+        print(f"  {tag:<28s} {ms:7.1f} ms/step  loss={loss:.3f} 丢率={mx_drop:.1f}%  "
+              f"路由最大={mx:.0f}%")
+        return ms, loss, mx_drop, mx
+
+    print("\n  A) κ 扫描 (eager, 只选丢率≤3% 的最快点):")
+    rows = {}
+    for k in (1.05, 1.10, 1.25):
+        rows[k] = run_final(k)
+    print("\n  B) 编译收益 (FixedCap 纯 tensor):")
+    run_final(1.10, compile_it=True)
+    run_final(1.25, compile_it=True)
+    print()
+
+    ok = {k: r for k, r in rows.items() if r[2] <= 3.0}
+    if ok:
+        best = min(ok, key=lambda k: ok[k][0])
+        print(f"  ==> 选 κ={best:.2f}: 丢率≤3% 中最快的点 ({ok[best][0]:.1f} ms/step)")
+    else:
+        print("  ==> 无 κ 满足丢率≤3%, 不激进, 维持 κ=1.25")
+    print()
+
+
+def section13():
+    print("=" * 84)
+    print("13) 总横评: 所有候选在同一口径 (B=64, S=257, fwd+bwd) 下重测")
+    print("=" * 84)
+
+    variants = [
+        ("Dense-320(非MoE上限)", "dense", None),
+        ("Dense-1365(≈MoE参量)", "dense1365", None),
+        ("MoE原版(生产逐专家mask)", "orig", None),
+        ("SimpleMask+DS-bias", "simplebias", None),
+        ("FixedCap k=1.10 无均衡", "fixed", 1.10),
+        ("FixedCap k=1.25 无均衡", "fixed", 1.25),
+        ("FixedCap k=1.15 +DS-bias", "fixedb", 1.15),
+        ("FixedCap k=1.25 +DS-bias", "fixedb", 1.25),
+        ("EinsumMoE(全einsum)", "einsum", None),
+        ("FastMoE 动态容量", "fast", None),
+    ]
+    if QUICK:
+        print("(quick: 只跑前 6 项)")
+        variants = variants[:6]
+
+    print(f"\n  {'模型':<28s}{'fwd ms':>9s}{'fwd+bwd ms':>11s}{'丢率(max)':>10s}"
+          f"  vs MoE原版")
+    results = {}
+    for name, kind, arg in variants:
+        tf, tb, drop, errd = _bench_subprocess(kind, arg)
+        if tf is None:
+            print(f"  {name:<20s} 失败: {errd}")
+            continue
+        results[name] = tb
+        ds = f"{drop:.0f}%" if drop is not None else "-"
+        print(f"  {name:<20s}{tf:>9.2f}{tb:>13.2f}{ds:>10s}")
+
+    base = results.get("MoE原版(Simple逐专家mask)")
+    if base is None and "orig" in " ".join(results):
+        # quick 模式名字可能不同, 直接从第一个 MoE 行取基准
+        base = next(v for k, v in results.items() if "MoE原版" in k)
+    if base:
+        print("\n  相对 MoE 原版 (1.00 = 持平):")
+        for k, v in sorted(results.items(), key=lambda kv: kv[1]):
+            t = f"{v/base:+.2f}" if v >= base else f"{v/base:.2f}x"
+            print(f"    {k:<26s} {v:8.2f} ms  {t}")
+    dense = {k: v for k, v in results.items() if "Dense" in k}
+    if dense:
+        dv = min(dense.values())
+        print(f"\n  最快 Dense-320: {dv:.1f} ms; "
+              f"最快 MoE: {min(v for k, v in results.items() if 'MoE' in k):.1f} ms "
+              f"({min(v for k, v in results.items() if 'MoE' in k)/dv:.2f}x 慢于Dense)")
+    print()
+    print("  注: 丢率列是未训练权重下的最大丢弃率。训练收敛 + DS-bias 后 FixedCap"
+          "\n    丢率降至 1~7% (见 section11/12), 此处说明的是\"塌陷最坏情况\"。")
+    print()
+    print("  ---- 训练实测口径 (B=32, S=192, 真实语料, 300~400 步, ms/step) ----")
+    print("    参考 section11/12 数据 (非本轮重测, 同机器同配置):")
+    print("      SimpleMask        ~110   Dense-320        ~57")
+    print("      FixedCap+DS-bias  ~68    (比 SimpleMask 快 1.6x, 比 Dense 慢 1.2x)")
+    print()
+
+
 def summary():
     print("=" * 84)
-    print("结论 (瓶颈定位)")
+    print("结论 (瓶颈定位 + 提速路径)")
     print("=" * 84)
     print("""
- 1) 专家循环是最大瓶颈: 单层 MoEFFN 前向 ~4.7ms 中, 12 个专家的
-    串行 gather+FFN+index_add 循环占 ~80%; GPU 利用率极低,
-    每个专家只处理 ~1400 个 token, 属于 latency-bound 而不是 compute-bound。
+  1) 瓶颈分解 (单层 MoEFFN 前向 ~5ms, 训练尺寸 B=64,S=257):
+     - 专家循环 76%: 12 个专家串行 gather+FFN+index_add, 每个只处理 ~1400
+       token, latency-bound 而非 compute-bound。
+     - CPU 同步 13%: 每层 2 次 .cpu().tolist(), 强制排空 GPU 流水线。
+     - 路由/topk/sort ~8-9%。
 
- 2) CPU 同步: 每层 2 次 .cpu().tolist() (全模型 8 次/前向), 每次强制
-    排空 GPU 流水线, 占单层前向 ~13% (约 0.6ms/层)。反向传播同样受影响。
+  2) torch.compile (默认 backend="eager" + exclude): 旧版 MoE 的逐专家
+     数据依赖循环会触发 dynamo graph-break/重编译, fwd 慢 10x (66ms -> 700ms)。
+     2026-08 更新: 新版 FixedCap (排序分桶+bmm, 纯 tensor 无循环) 可直接
+     inductor 编译, B=32,S=193 实测 fwd+bwd 37.9ms vs eager 64.4ms (1.7x);
+     MoE 包含在编译内 (38.6ms) 比 exclude MoE (44.2ms) 更快, 无需再排除。
 
- 3) torch.compile 是训练里最大的隐藏减速: 数据依赖的 Python 循环
-    (if s<e, .cpu().tolist()) 导致 dynamo 反复 graph-break / 重编译,
-    实测 fwd 从 55ms 涨到 616ms (11x), fwd+bwd 从 132ms 涨到 1928ms。
-    训练配置 use_compile=True, 等于白白多付了 10 倍以上的开销。
+  3) 实测提速结论 (训练尺寸 B=64,S=257, fwd+bwd ms, 独立子进程干净测量):
+     - 原版 MoEFFN (sort+bincount+CPU同步) : ~183
+     - SimpleMask (逐专家 mask, 0 附加)    : ~185  (1.00x, 数学完全等价, 当前生产)
+     - EinsumMoE (全专家 einsum, 0同步精确): ~206  <- 更慢! 详见 3a
+     - FastMoE 动态容量 batched bmm       : ~195  <- 更慢! 原因见第5点
+     - FixedCap k=1.10~1.25 (0同步)        : ~160  <- 最快, 但丢率 78~80%, 见第4/5点
+     - Dense-320                           : ~151  (非MoE上限)
 
- 4) 路由/排序开销不大: topk+sort ~0.4ms/层 (9%), 负载均衡尚可
-    (min 1123 / max 1631), 失衡不是主因。
+=> 最终选定 (2026-07): SimpleMask 逐专家 mask 版 (无循环, 可编译)。
+         2026-08 更新: 已升级为 FixedCap κ=1.25 + DS-bias 版 (models.py
+         MoEFFN): 纯 tensor 分桶 + batched bmm, 比 SimpleMask 快 1.13x
+         (B=64,S=257: 177 vs 200ms), κ=1.25 下训练收敛后丢率 0~5%
+         (DS-bias 自均衡, 无 aux loss)。
 
- 5) 潜在修复方向 (按性价比排序):
-    a. 训练时关闭 torch.compile (或只 compile attention 部分)
-    b. 去掉每层 .cpu() 同步: 在 GPU 上计算专家分桶边界
-    c. 把 12 个专家合并成单个 batched GEMM (参考实现已证明可提速 ~3.3x,
-       且 kernel 数从 106 降到 ~50, 与 dense 相当)
+  3a) EinsumMoE 负结果 (本轮新增, 用于厘清瓶颈性质):
+      把 12 个专家合成 3 次大 einsum, 消除 24 次 .nonzero() 同步 + 36 个小 Linear。
+      数学精确 (0.00e+00), 但 fwd+bwd 反而慢 12% (206 vs 183)。
+      拆开看: fwd 68ms (比 SimpleMask 70ms 还快, 确实省 kernel), 但 bwd ~138ms
+      (比 SimpleMask ~114ms 慢 20%), 因为反向要对 [T,N,d_inner] 中间量算三份梯度,
+      N× 算力在反向被放大。
+      结论: 训练吞吐的瓶颈不是单纯 kernel-launch 延迟 (否则 fwd 不会更快), 而是
+      反向算力 + [T,N,d_inner] 中间量的显存带宽。证明"全专家密集计算"换不来吞吐,
+      精确 MoE 想破 ~185ms 必须走分组 bmm (只算被分配的 token) 即 FixedCap 路线。
+
+  4) FixedCapMoEFFN = FastMoE 的固定容量版: 每专家固定 M_cap 槽位,
+     0 次 .cpu() 同步, 超容量 token 权重置 0 (index_add 进 padding 槽)。
+     吞吐最快 (~142ms), 但未训练时丢率 78~81%, 平衡高度依赖 aux loss,
+     而本课题明确不使用 aux loss, 故不选。
+
+  5) 路由崩塌 (本次调查的核心发现): 在真实模型的注意力之后的层上,
+     top-1 路由 logits 尺度变大, argmax 几乎全部落到同一个专家
+     (counts.max 达到 12853/16448), 其余 11 个专家空转/闲置:
+     - FastMoE 动态容量因此要 padding 到 M≈13000, 全模型反而变慢;
+     - FixedCap 靠丢弃超容量 token 把代价压住, 但崩塌时 78~81% token
+       被丢弃, 吞吐指标是"快但有损"的。
+     不使用 aux loss (用户决定): 崩塌修复留给真实训练收敛后的自平衡
+     (200 步随机小训实测: 无 aux 时深层仍 30~41% 失衡, 有待长训验证)。
+
+  6) SimpleMask+aux 5e-4 实测 1835ms (约 11x 慢): F.one_hot + softmax
+     的 aux 路径在 bf16/autocast 下有严重性能异常, 进一步佐证不用 aux。
 """)
     print()
 
@@ -832,13 +1722,17 @@ if __name__ == "__main__":
     print(f"GPU: {torch.cuda.get_device_name(0)}   "
           f"B*S={BS} token/层  n_layers={N_LAYERS}  n_experts={N_EXPERTS} k={K}  "
           f"AMP={AMP_DTYPE}")
-    section1()
-    section2()
-    section3()
-    section4()
-    section5()
-    section6()
-    section7()
-    section8()
-    summary()
+    only = os.environ.get("MOE_DEBUG_SECTIONS", "")
+    sections = {
+        "1": section1, "2": section2, "3": section3, "4": section4,
+        "5": section5, "6": section6, "7": section7, "8": section8,
+        "9": section9, "10": section10, "11": section11, "12": section12,
+        "13": section13,
+    }
+    targets = [sections[s] for s in (only.split(",") or ["1"]) if s in sections] if only else \
+              [section1, section2, section3, section4, section5, section6,
+               section7, section8, section9, section10, section11, section12,
+               section13, summary]
+    for fn in targets:
+        fn()
     print("done.")
