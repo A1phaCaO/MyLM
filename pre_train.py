@@ -1,3 +1,8 @@
+import os
+import subprocess
+import sys
+import glob
+import re
 from models import MyLMArgs, MyLM, exclude_moe_from_compile
 from dataset import TextDatasetV4, RuntimeTextDatasetV4, PretrainTextDataset, PretrainTokenIDDataset
 from utils import (
@@ -28,6 +33,22 @@ import torch
 import os
 # 设置环境变量以解决OpenMP库重复初始化问题
 os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
+# ---------------------------------------------------#
+#   matplotlib 中文字体 (图表标签使用中文)
+# ---------------------------------------------------#
+from matplotlib import font_manager as _fm  # noqa: E402
+
+for _f in [
+    r"C:\Windows\Fonts\msyh.ttc",     # 微软雅黑
+    r"C:\Windows\Fonts\simhei.ttf",   # 黑体
+    r"C:\Windows\Fonts\simsun.ttc",   # 宋体
+]:
+    if os.path.exists(_f):
+        _fm.fontManager.addfont(_f)
+        plt.rcParams["font.sans-serif"] = [
+            _fm.FontProperties(fname=_f).get_name(), "DejaVu Sans"]
+        break
+plt.rcParams["axes.unicode_minus"] = False
 
 
 # ---------------------------------------------------#
@@ -54,31 +75,32 @@ class TrainingConfig:
     model_save_dir: str = r"model\model_xl.pth"
     ckpt_save_dir: str = r"ckpt\ckpt.pth"
     config_save_dir: str = r"model\config_xl.json"
-    log_dir: str = r"logs/" + time.strftime("%Y%m%d-%H%M%S")
-    # log_dir: str = r"logs/20260102-143753"
+    log_dir: str = r"logs/" +"xl3_"+ time.strftime("%Y%m%d-%H%M%S")
+    # log_dir: str = r"logs\xl2_20260809-190755"
     padding_side = "right"
 
     # 训练参数
     seed: int = 42
     epochs: int = 1
-    batch_size: int = 64
+    batch_size: int = 48
     batch_acceleration: int = 4
     dataset_downsample: int = 1
-    valset_rate: float = 0.0018
+    valset_rate: float = 0.0017
     val_interval_step: int = 1000
-    seq_max_len = 256   # 对齐 v3 存储长度 193 (=192+1)，loader 零 pad
-    use_compile: bool = False
+    seq_max_len = 256   # 对齐 v3 存储长度 257 (=256+1)，loader 零 pad
+    use_compile: bool = True
     # "max-autotune" or "default" or "reduce-overhead"
     compile_mode: str = "max-autotune"
     # compile 时是否将 MoE 层排除在外（eager 执行）：
-    # MoE 专家循环含 CPU 同步与数据依赖循环，被 compile 追踪反而更慢
-    exclude_moe_from_compile: bool = True
+    # 【已过时】旧逐专家循环才需要排除；新 FixedCap 纯 tensor 分桶可编译，
+    # 实测排除 MoE 反而慢 14%（44.2ms vs 38.6ms），保持默认 False
+    exclude_moe_from_compile: bool = False
 
     # 优化参数
     learning_rate: float = 4e-3
-    min_learning_rate: float = 4e-4  # WSD LRS衰减到10%
+    min_learning_rate: float = 4e-4  # WSD LRS衰减到峰值LR的10%
     lr_decay_start_rate: int = 0.75  # 最后衰减
-    warmup_steps: int = 2
+    warmup_steps: int = 6
     use_amp: bool = True
 
     model_args = MyLMArgs(
@@ -88,12 +110,12 @@ class TrainingConfig:
         d_inner=int(((256 * (8 / 3)) // 64) * 64),
         d_head=128,
         n_heads=None,
-        n_layers=6,
+        n_layers=8,
         vocab_size=None,
         seq_max_len=seq_max_len,
         use_moe=True,
-        n_experts=6,
-        n_experts_per_tok=3,
+        n_experts=12,
+        n_experts_per_tok=2,
         d_conv=None,
         conv_bias=None,
         ffn_bias=False,
@@ -104,15 +126,23 @@ class TrainingConfig:
 
     # 新增参数：checkpoint保存间隔步数
     ckpt_interval_step: int = 1000
-    # 保留最近N个checkpoint，超过自动清理（0表示不清理）
-    max_ckpts_to_keep: int = 3
+    # checkpoint 自动清理：保留最近 ckpt_keep_recent 个，
+    # 更早的每隔 ckpt_keep_stride 个保留 1 个（0 表示不清理）
+    ckpt_keep_recent: int = 3
+    ckpt_keep_stride: int = 3
     # 新增参数：断点续训的checkpoint路径
-    # resume_from: Optional[str] = r"ckpt\ckpt_epoch_0_step_6000.pth"
+    # resume_from: Optional[str] = r"ckpt\ckpt_epoch_0_step_24000.pth"
     resume_from: Optional[str] = None
+    # 数据集固定种子 shuffle（在 PretrainTokenIDDataset 内部实现，替代 DataLoader
+    # 原版 RandomSampler：续训时排列完全由 seed 决定，从已消费位置继续无重复。
+    # 置 None 则退回原版 DataLoader shuffle 行为）
+    dataset_shuffle_seed: Optional[int] = 42
 
 
 class PreTrainer:
     def __init__(self, config: TrainingConfig):
+        # 允许 float32 矩阵乘使用 TF32 tensor cores（消除 inductor 警告并提速）
+        torch.set_float32_matmul_precision("high")
         self.config = config
         self._set_seed()
         self.device = torch.device(
@@ -139,7 +169,13 @@ class PreTrainer:
         self.train_loss_log = []  # 将改为存储(step, loss)格式
         self.val_loss_log = []
         self.lr_log = []
-        self.ckpt_paths = []  # 跟踪已保存的checkpoint路径，用于自动清理
+        # 跟踪已保存的checkpoint路径，用于自动清理。
+        # 初始扫描磁盘已有文件（按时间顺序），保证恢复训练后
+        # "最近 a 个"以磁盘真实文件为口径，而不是只算本次进程新保存的
+        self.ckpt_paths = self._scan_existing_ckpts()
+        # 曾保存过的所有 step 序号（升序，含已被清理的文件），
+        # 清理时以这里的绝对序号判定"每隔 b 个保留 1 个"，避免锚点漂移
+        self.ckpt_seq = [self._step_of(p) for p in self.ckpt_paths]
         self.writer = None  # TensorBoard SummaryWriter，在 train() 中赋值
 
         # 如果指定了resume_from路径，加载checkpoint
@@ -166,8 +202,10 @@ class PreTrainer:
                     print(
                         f"[compile] 已将 {n_excluded} 个 MoE 层排除在 torch.compile 之外（eager 执行）"
                     )
+            # 默认后端 inductor: 真融合才有加速 (eager 后端只捕获图不融合, 实测无加速)
+            # 注意: Windows 上需 PYTHONUTF8=1 环境变量, 否则 inductor 读模板时 GBK 解码崩溃
             model = torch.compile(
-                model, mode=self.config.compile_mode, backend="eager"
+                model, mode=self.config.compile_mode
             )
         return model
 
@@ -178,6 +216,7 @@ class PreTrainer:
             seq_max_len=self.config.seq_max_len,
             downsample=self.config.dataset_downsample,
             padding_side=self.config.padding_side,
+            shuffle_seed=self.config.dataset_shuffle_seed,
             # dtype 默认 uint16，与 generate_dataset_v3 一致；若 v3 改 int32 这里也改
         )
         val_dataset_len = int(len(dataset) * self.config.valset_rate)
@@ -189,18 +228,26 @@ class PreTrainer:
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
-            shuffle=True,
+            # 已由 PretrainTokenIDDataset(shuffle_seed=...) 固定排列，
+            # 关掉原版 RandomSampler：续训时按已消费 batch 位置继续，数据不重复
+            shuffle=False,
+            # drop_last：保证 batch 形状恒定，避免 CUDAGraph 为不齐的最后一个 batch
+            # 反复录制动态形状图（torch.compile reduce-overhead）
+            drop_last=True,
             pin_memory=True,
-            num_workers=5,
-            prefetch_factor=3,
+            num_workers=6,
+            prefetch_factor=4,
             persistent_workers=True
         )
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
+            drop_last=True,
             pin_memory=True,
             num_workers=4,
+            prefetch_factor=3,
+            persistent_workers=True
         )
 
         return train_loader, val_loader
@@ -244,15 +291,15 @@ class PreTrainer:
                 muon_params,
                 lr=self.config.learning_rate,
                 adjust_lr_fn="match_rms_adamw",
-                weight_decay=0.008,
+                weight_decay=0.01,
             ),
             bnb.optim.adamw.AdamW8bit(
                 other_params,
                 lr=self.config.learning_rate,
                 amsgrad=False,
                 betas=(0.85, 0.999),
-                eps=1e-6,
-                weight_decay=0.008,
+                eps=1e-7,
+                weight_decay=0.01,
             ),
         ]
 
@@ -265,10 +312,12 @@ class PreTrainer:
         # )
         # ]
 
-        total_steps = (
-            self.config.epochs
-            * (len(self.train_loader) // self.config.batch_acceleration + 1)
-        ) + 1
+        # 每个 epoch 的实际优化步数 = ceil(len / batch_acceleration)
+        # （is_step_boundary 在 batch_acceleration 整数倍及每 epoch 最后一批时 step）
+        steps_per_epoch = (
+            len(self.train_loader) + self.config.batch_acceleration - 1
+        ) // self.config.batch_acceleration
+        total_steps = self.config.epochs * steps_per_epoch + 1
 
         # WarmUpCosineLR
         # schedulers = [
@@ -288,9 +337,12 @@ class PreTrainer:
                 optimizer,
                 total_steps=total_steps,
                 warmup_steps=self.config.warmup_steps,
-                stable_steps=int(
-                    self.config.lr_decay_start_rate * total_steps
-                    - self.config.warmup_steps
+                stable_steps=max(
+                    0,
+                    int(
+                        self.config.lr_decay_start_rate * total_steps
+                        - self.config.warmup_steps
+                    ),
                 ),
                 min_lr=self.config.min_learning_rate,
                 decay_mode="linear",
@@ -304,7 +356,8 @@ class PreTrainer:
         """保存checkpoint
         - 完整训练状态（模型+优化器+调度器+RNG）保存到 path，用于断点续训
         - is_final=True 时额外保存纯模型权重到 model_save_dir
-        - 非 final 保存会自动清理旧 checkpoint，仅保留最近 max_ckpts_to_keep 个
+        - 非 final 保存会自动清理旧 checkpoint：保留最近 ckpt_keep_recent 个，
+          更早的每隔 ckpt_keep_stride 个保留 1 个
         """
         # 检测是否是DataParallel模式
         if isinstance(self.model, nn.DataParallel):
@@ -344,17 +397,60 @@ class PreTrainer:
         if not is_final:
             # 跟踪并自动清理旧 checkpoint
             self.ckpt_paths.append(path)
-            keep = self.config.max_ckpts_to_keep
-            if keep > 0:
-                while len(self.ckpt_paths) > keep:
-                    oldest = self.ckpt_paths.pop(0)
-                    if os.path.exists(oldest):
-                        os.remove(oldest)
-                        print(f"[ckpt] 已清理旧checkpoint: {oldest}")
+            step = self._step_of(path)
+            if step >= 0 and step not in self.ckpt_seq:
+                self.ckpt_seq.append(step)
+            self._prune_ckpts()
         else:
             # final: 额外保存纯模型权重
             torch.save(model_state_dict, self.config.model_save_dir)
             print(f"[ckpt] 保存模型权重: {self.config.model_save_dir}")
+
+    @staticmethod
+    def _step_of(path: str) -> int:
+        """从 checkpoint 文件名解析 step 序号（如 ckpt_epoch_0_step_30000.pth -> 30000）"""
+        m = re.search(r"_step_(\d+)\.pth$", os.path.basename(path))
+        return int(m.group(1)) if m else -1
+
+    def _scan_existing_ckpts(self):
+        """扫描 ckpt 目录中已有的 step checkpoint，按修改时间排序返回。
+        - 只识别 ckpt_*_step_*.pth（不含 epoch 末的 is_final 文件）
+        - 非递归，backup 子目录不会被扫到
+        """
+        ckpt_dir = os.path.dirname(self.config.ckpt_save_dir) or "."
+        paths = [
+            p for p in glob.glob(os.path.join(ckpt_dir, "ckpt_*_step_*.pth"))
+            if os.path.isfile(p)
+        ]
+        paths.sort(key=os.path.getmtime)
+        return paths
+
+    def _prune_ckpts(self):
+        """自动清理旧checkpoint：
+        - 最近 ckpt_keep_recent 个全部保留（ckpt_paths 列表尾部）
+        - 更早的按 ckpt_seq 绝对保存序，每隔 ckpt_keep_stride 个保留 1 个
+          （用绝对序号而非存活列表位置，保证删除后锚点不漂移）
+        """
+        recent = self.config.ckpt_keep_recent
+        stride = self.config.ckpt_keep_stride
+        if recent <= 0 or len(self.ckpt_paths) <= recent:
+            return
+        keep_paths = set(self.ckpt_paths[-recent:])  # 最近 a 个全保留
+        for p in self.ckpt_paths[:-recent]:
+            step = self._step_of(p)
+            if step in self.ckpt_seq:
+                idx = self.ckpt_seq.index(step)  # 绝对保存序号
+                if idx % stride == 0:
+                    keep_paths.add(p)
+        removed = 0
+        for p in self.ckpt_paths[:-recent]:
+            if p not in keep_paths and os.path.exists(p):
+                os.remove(p)
+                removed += 1
+        if removed:
+            print(f"[ckpt] 已清理 {removed} 个旧checkpoint")
+        # 重建存活路径列表（保持时间顺序，尾部即最近的）
+        self.ckpt_paths = [p for p in self.ckpt_paths if os.path.exists(p)]
 
     def load_checkpoint(self, checkpoint_path: str):
         """加载checkpoint"""
@@ -443,8 +539,10 @@ class PreTrainer:
                 self.scaler.step(optimizer)
             self.scaler.update()
             # 对每个优化器单独清零梯度
+            # 注意: set_to_none=False 保持 .grad 缓冲稳定（配合 train() 中的预分配），
+            # 避免 CUDAGraph(torch.compile reduce-overhead) 梯度累积时报错
             for optimizer in self.optimizers:
-                optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad(set_to_none=False)
             # 对每个调度器单独执行step
             for scheduler in self.schedulers:
                 scheduler.step()
@@ -479,29 +577,111 @@ class PreTrainer:
         }
 
     def _log_moe_stats(self, writer, moe_stats, step):
-        """将MoE负载均衡统计写入TensorBoard
-        逐层标量合并为直方图（每步一帧、横轴为层），另保留跨层平均值曲线
+        """将 MoE 运行时负载统计写入 TensorBoard。
+
+        只保留最有代表性的信号:
+        - MoE/drop_rate        标量:   跨层平均丢 token 率 (κ 是否够用, 应 <10%)
+        - MoE/router_entropy   标量:   跨层平均归一化路由熵 (1.0=完全均匀)
+        - MoE/heatmap          图像:   (step × 层) 热力图, 每次验证更新
+        - MoE/heatmap_3d      图像:   同数据的三维折线图
+        - MoE/expert_load      直方图: 所有层×专家的负载分布 (横轴=负载占比,
+          纵轴=样本频次; 观察是否有专家空转/过载)
         """
         n = len(moe_stats)
-        metrics = {
-            "aux_loss": torch.zeros(n),
-            "router_entropy": torch.zeros(n),
-            "top1_conf": torch.zeros(n),
-            "balance_ratio": torch.zeros(n),
-        }
         load_all = []
+        drop_all = torch.zeros(n)
+        entropy_all = torch.zeros(n)
         for i, (layer_idx, s) in enumerate(moe_stats):
-            metrics["aux_loss"][i] = s["aux_loss"]
-            metrics["router_entropy"][i] = s["router_entropy"]
-            metrics["top1_conf"][i] = s["top1_conf"]
-            metrics["balance_ratio"][i] = s["balance_ratio"]
             load_all.append(s["expert_load"])
-        # 逐层标量 → 直方图
-        for name, vals in metrics.items():
-            writer.add_histogram(f"MoE/{name}", vals, step)
-            writer.add_scalar(f"MoE/avg_{name}", vals.mean().item(), step)
-        # 所有层所有专家的负载占比合并为一张直方图
+            drop_all[i] = s["drop_rate"]
+            entropy_all[i] = s["router_entropy"]
+        writer.add_scalar("MoE/drop_rate", drop_all.mean().item(), step)
+        writer.add_scalar("MoE/router_entropy",
+                          entropy_all.mean().item(), step)
         writer.add_histogram("MoE/expert_load", torch.cat(load_all), step)
+        # 逐帧累积 (step × 层) 矩阵, 每次验证都画全历史热力图
+        if not hasattr(self, "_moe_heat_hist"):
+            self._moe_heat_hist = {"drop": [], "entropy": []}
+        self._moe_heat_hist["drop"].append(drop_all.numpy())
+        self._moe_heat_hist["entropy"].append(entropy_all.numpy())
+        self._log_moe_heatmap(writer, step)
+
+    def _log_moe_heatmap(self, writer, step):
+        """把截至目前的全历史逐层指标写成 3D 折线图 + 2D 热力图双视图。
+
+        - MoE/heatmap_3d  图像: 每条线=一层, z=drop_rate, 每次验证追加
+        - MoE/heatmap     图像: 左=drop_rate 右=router_entropy 热力图
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.gridspec import GridSpec
+        hist_drop = np.asarray(
+            self._moe_heat_hist["drop"])      # [T, n_layers]
+        hist_ent = np.asarray(
+            self._moe_heat_hist["entropy"])    # [T, n_layers]
+        n_layer = hist_drop.shape[1]
+
+        # ---- 3D 折线图: 整体走势 (x=帧, y=层, z=值) ----
+        fig3d = plt.figure(figsize=(8.5, 5.2))
+        ax3d = fig3d.add_subplot(111, projection="3d")
+        x = np.arange(len(hist_drop))
+        for li in range(n_layer):
+            ax3d.plot(
+                x, np.full(len(x), li), hist_drop[:, li],
+                label=f"L{li}", linewidth=1.8,
+            )
+        ax3d.set_xlabel("校验帧")
+        ax3d.set_ylabel("层")
+        ax3d.set_zlabel("丢token率")
+        ax3d.set_yticks(range(n_layer))
+        ax3d.legend(loc="upper left", ncol=2, fontsize=8)
+        ax3d.view_init(elev=22, azim=-60)
+        fig3d.canvas.draw()
+        img3d = np.ascontiguousarray(
+            np.asarray(fig3d.canvas.buffer_rgba())[:, :, :3])
+        writer.add_image("MoE/heatmap_3d", img3d, step, dataformats="HWC")
+        plt.close(fig3d)
+
+        # ---- 2D 热力图: drop_rate / router_entropy ----
+        fig = plt.figure(figsize=(14, 4.2))
+        gs = GridSpec(1, 2, width_ratios=[1.5, 1.5], wspace=0.3)
+        for col, (tag, data) in enumerate(
+            [("drop_rate", hist_drop), ("router_entropy", hist_ent)]
+        ):
+            ax = fig.add_subplot(gs[col])
+            vmax = max(1.0, data.max())
+            im = ax.imshow(
+                data.T, aspect="auto", cmap="viridis",
+                vmin=0.0, vmax=vmax,
+            )
+            ax.set_yticks(range(n_layer))
+            ax.set_yticklabels([f"L{i}" for i in range(n_layer)])
+            ax.set_xlabel(f"校验帧 (每帧={self.config.val_interval_step}步)")
+            ax.set_title(f"MoE {tag}")
+            fig.colorbar(im, ax=ax, fraction=0.046)
+        fig.canvas.draw()
+        # matplotlib>=3.8: buffer_rgba() 代替 tostring_rgb()
+        buf = np.asarray(fig.canvas.buffer_rgba())[:, :, :3]
+        img = np.ascontiguousarray(buf)
+        writer.add_image("MoE/heatmap", img, step, dataformats="HWC")
+        plt.close(fig)
+
+    def _active_params(self):
+        """MoE 激活参数量: 专家权重按每 token 实际激活比例 K/N 折算, 其余全量。
+        (总参数量含全部专家权重, 但推理/训练时每个 token 只经过 K 个专家)
+        """
+        args = self.config.model_args
+        model = self.model.module if isinstance(
+            self.model, nn.DataParallel) else self.model
+        if not args.use_moe:
+            return sum(p.numel() for p in model.parameters())
+        total = 0
+        for name, p in model.named_parameters():
+            numel = p.numel()
+            # MoE 专家权重 (w_gate/w_up/w_down) 只算激活的 K/N 部分
+            if "mlp." in name and name.endswith(("w_gate", "w_up", "w_down")):
+                numel = numel * args.n_experts_per_tok / args.n_experts
+            total += numel
+        return total
 
     def log(self):
         total_params = model_structure(self.model)
@@ -517,6 +697,18 @@ class PreTrainer:
         nums_token = self.config.model_args.seq_max_len * train_dataset_len
         print(f"Token数约：{nums_token/1e6:.3f}M")
         print(f"模型参数：{total_params/1e6:.3f}M")
+        if self.config.model_args.use_moe:
+            active_params = self._active_params()
+            print(
+                f"激活参数（MoE 专家×{self.config.model_args.n_experts_per_tok}/"
+                f"{self.config.model_args.n_experts}）：{active_params/1e6:.3f}M "
+                f"({active_params/total_params*100:.1f}%)"
+            )
+            print(
+                f"计算量（按激活参数）：{(nums_token * active_params * 6)/1e12:.2f} "
+                f"TFLOPs * {self.config.epochs} = "
+                f"{(nums_token * active_params * 6 * self.config.epochs)/1e12:.2f}TFLOPs"
+            )
         print(
             f"计算量：{(nums_token * total_params * 6)/1e12:.2f}TFLOPs * {self.config.epochs} = {(nums_token * total_params * 6 * self.config.epochs)/1e12:.2f}TFLOPs"
         )
@@ -542,6 +734,12 @@ class PreTrainer:
                 if isinstance(self.model, nn.DataParallel)
                 else self.model
             )
+
+        # 预分配 .grad 缓冲，避免 CUDAGraph(torch.compile reduce-overhead) 梯度累积时
+        # 访问被后续运行覆盖的 grad 张量（RMSNorm.forward 报错即此原因）
+        for p in self.model.parameters():
+            if p.requires_grad and p.grad is None:
+                p.grad = torch.zeros_like(p)
 
         for epoch in range(self.config.epochs):
             bar = tqdm(self.train_loader, unit="step")
@@ -570,8 +768,9 @@ class PreTrainer:
             for i, (train_inputs, train_targets, train_mask) in enumerate(
                 self.train_loader
             ):
-                # 跳过已训练的step
-                if i <= self.start_step and epoch == self.start_epoch:
+                # 跳过已训练的step（非 resume 时 start_step=0，不跳过任何 batch；
+                # resume 时从 start_step 位置继续，`i <` 保证不重复消费）
+                if i < self.start_step and epoch == self.start_epoch:
                     continue
                 self.current_step = i
                 # 提前计算 need_val：基于 i 和 step 后的 global_step（即 global_step+1）
@@ -774,65 +973,83 @@ class PreTrainer:
                             per_layer_weight_norms (1D tensor)
         """
         self.model.eval()
-        val_loss_sum = 0
-        entropy_sum = 0.0
-        correct_top1 = 0
-        correct_top5 = 0
-        total_tokens = 0
         vocab_size = self.config.model_args.vocab_size
+        device = self.device
 
-        with torch.no_grad():
+        # 聚合统计放在 GPU 张量上，循环结束后统一 .item() 一次性同步，
+        # 避免每 batch 一次 item() 强制 GPU->CPU 同步打断流水线（验证提速关键）
+        loss_acc = torch.zeros((), device=device)
+        entropy_acc = torch.zeros((), device=device)
+        top1_acc = torch.zeros((), device=device, dtype=torch.long)
+        top5_acc = torch.zeros((), device=device, dtype=torch.long)
+        total_tokens = torch.zeros((), device=device, dtype=torch.long)
+
+        with torch.inference_mode():
             for val_inputs, val_targets, val_mask in self.val_loader:
-                val_inputs = val_inputs.to(self.device)
-                val_targets = val_targets.to(self.device)
-                val_mask = val_mask.to(self.device)
-                with torch.autocast(str(self.device), enabled=self.config.use_amp):
+                val_inputs = val_inputs.to(device)
+                val_targets = val_targets.to(device)
+                val_mask = val_mask.to(device)
+                with torch.autocast(str(device), enabled=self.config.use_amp):
                     val_output = self.model(val_inputs)
                     logits = val_output.view(-1, vocab_size)
                     targets_flat = val_targets.view(-1)
                     mask_flat = val_mask.view(-1)
                     loss = self.criterion(logits, targets_flat)
                     loss = (loss * mask_flat).sum() / mask_flat.sum()
-                val_loss_sum += loss.item()
+                loss_acc += loss.float()
 
                 # 计算 entropy / top-k accuracy（用 float32 精度，仅对有效 token）
                 probs = torch.softmax(logits.float(), dim=-1)
                 log_probs = torch.log(probs + 1e-10)
                 entropy = -(probs * log_probs).sum(dim=-1)  # (B*L,)
                 valid_mask = mask_flat > 0
-                entropy_sum += (entropy * mask_flat).sum().item()
+                entropy_acc += (entropy * mask_flat).sum()
 
                 pred_top1 = probs.argmax(dim=-1)
-                correct_top1 += (
-                    (pred_top1 == targets_flat) & valid_mask
-                ).sum().item()
+                top1_acc += ((pred_top1 == targets_flat) & valid_mask).sum()
 
                 if vocab_size >= 5:
                     _, pred_top5 = probs.topk(5, dim=-1)
-                    correct_top5 += (
+                    top5_acc += (
                         (
                             pred_top5 == targets_flat.unsqueeze(-1)
                         ).any(dim=-1) & valid_mask
-                    ).sum().item()
+                    ).sum()
                 else:
-                    correct_top5 = correct_top1  # vocab 不足时退化为 top1
+                    top5_acc = top1_acc  # vocab 不足时退化为 top1
 
-                total_tokens += valid_mask.sum().item()
+                total_tokens += valid_mask.sum()
 
         n = len(self.val_loader)
-        avg_loss = val_loss_sum / n
+        if n == 0:
+            # val_loader 为空（数据过小时 drop_last 可能产生 0 个 val batch），
+            # 避免除零崩溃，返回无效指标让调用处正常走日志
+            print("警告: 验证集为空（0 个 batch），跳过本轮验证")
+            weight_stats = self._compute_weight_stats()
+            return (
+                float("inf"),
+                float("inf"),
+                {
+                    "entropy": 0.0,
+                    "top1_acc": 0.0,
+                    "top5_acc": 0.0,
+                    **weight_stats,
+                },
+            )
+        avg_loss = loss_acc.item() / n
         ppl = math.exp(avg_loss)
-        avg_entropy = entropy_sum / max(total_tokens, 1)
-        top1_acc = correct_top1 / max(total_tokens, 1)
-        top5_acc = correct_top5 / max(total_tokens, 1)
+        total = total_tokens.item()
+        avg_entropy = entropy_acc.item() / max(total, 1)
+        top1_acc_val = top1_acc.item() / max(total, 1)
+        top5_acc_val = top5_acc.item() / max(total, 1)
 
         # 参数统计量（仅算一次，模型参数在 val 期间不变）
         weight_stats = self._compute_weight_stats()
 
         return avg_loss, ppl, {
             "entropy": avg_entropy,
-            "top1_acc": top1_acc,
-            "top5_acc": top5_acc,
+            "top1_acc": top1_acc_val,
+            "top5_acc": top5_acc_val,
             **weight_stats,  # weight_norm, weight_max, weight_std, sparse_ratio, per_layer_weight_norms
         }
 

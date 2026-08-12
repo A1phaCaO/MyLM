@@ -1,0 +1,3 @@
+method,steps,elapsed_s,train_final,train_last50,train_first,val_loss,ppl,top1
+default,300,293.4,2.9763,2.9692,9.0566,3.5234,33.901,0.3237
+gpt2_002,300,289.5,2.9793,2.9572,8.9089,3.5273,34.033,0.3217

@@ -1,0 +1,2 @@
+method,steps,elapsed_s,train_final,train_last50,train_first,val_loss,ppl,top1
+default,60,62.4,4.393,4.8311,9.0326,4.3594,78.208,0.2174
