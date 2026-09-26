@@ -1,4 +1,5 @@
 train_text/
+data/
 logs/
 model/
 ckpt/
@@ -6,5 +7,13 @@ ckpt/
 .mypy_cache/
 __pycache__/
 .trae/
+.lingma/
+.qoder/
+.workbuddy/
 *.txt
 *.npy
+*.log
+data_process/*.jsonl
+# 一次性临时基准脚本（不进版本库）
+bench_*_tmp.py
+
