@@ -30,7 +30,7 @@ VOCAB_SIZE = 7168
 MIN_FREQUENCY = 2
 LIMIT_ALPHABET = 65535  # 初始字符词表大小上限（不含特殊 token），保证留有 BPE 合并空间
 FILE_PATH = r"train_text\merged.txt"
-OUTPUT_PATH = r"bpe_tokenizer_7k_260724_xl.json"
+OUTPUT_PATH = r"tokenizer/bpe_tokenizer_7k_260724_xl.json"
 
 
 def build_preprocessor():

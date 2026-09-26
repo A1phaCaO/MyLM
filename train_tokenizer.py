@@ -94,4 +94,4 @@ if BBPE:
     tokenizer.decoder = decoders.ByteLevel()
 
 # 5. 保存分词器
-tokenizer.save(r"bbpe_tokenizer_6k_260715.json")
+tokenizer.save(r"tokenizer/bbpe_tokenizer_6k_260715.json")

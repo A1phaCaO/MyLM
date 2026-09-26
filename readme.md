@@ -51,7 +51,7 @@ pip install torch
 python pre_train.py
 
 # 数据集生成
-python generate_dataset_v2.py
+python generate_dataset_v3.py
 
 # 训练分词器
 python train_tokenizer.py
@@ -66,22 +66,24 @@ Pytorch_GPT/
 ├── pre_train.py                 # 预训练脚本主入口
 ├── utils.py                     # 通用工具函数（包括学习率调度器等）
 ├── train_tokenizer.py           # BPE分词器训练
-├── generate_dataset_v*.py       # 多版本数据集生成脚本
-├── continue_training.py         # 继续训练脚本
+├── generate_dataset_v3.py       # 数据集生成（现役版本）
+├── generate_dataset_sft.py      # SFT数据集生成
 ├── continue_training_sft.py     # 监督微调训练脚本
-├── hyperparameter_search.py     # 超参数搜索工具
-├── validate_notebook.ipynb      # 模型验证Jupyter笔记本
-├── visualize_logs.py            # 训练日志可视化
-├── test_tokenizer.py            # 分词器测试
-├── reset_ckpt_config.py         # 检查点配置重置
-├── run_model.py                 # 模型推理运行
-├── run_model_for_state.py       # 模型状态检查
-├── config.json                  # 模型配置文件
-├── model_architecture_test.py   # 模型架构测试
-├── model_baseline.py            # 基线模型实现
-├── legacy_model.py              # 旧版模型实现
-├── legacy_module.py             # 旧版模块实现
-├── models_*.py                  # 不同版本的模型文件
+├── tools/                       # 小型辅助工具（从仓库根运行）
+│   ├── checks/                  # 验证/复现脚本：model_architecture_test、model_baseline、
+│   │                            #   test_tokenizer、validate_notebook、
+│   │                            #   verify_shuffle_resume、resume_replay_check、test_accum_equiv
+│   └── model_tools/             # 推理与检查：run_model_for_state、run_model_for_chat、
+│                                #   find_similar_words、visualize_logs、reset_ckpt_config
+├── debug_moe.py                 # MoE性能诊断（依赖仓库根cwd，勿移动）
+├── tokenizer_archive/           # 已退役分词器快照（无代码引用）
+├── tokenizer/                   # 现役与被引用的分词器 json
+├── data/                        # 生成后的数据集（.npy / SFT txt / 测试文本，gitignore）
+├── legacy/                      # 旧脚本与旧模型快照
+│   ├── scripts/                 #   continue_training.py(+models_250830.py)、
+│   │                            #   generate_dataset_v2.py、hyperparameter_search.py 等
+│   └── models/                  #   models_2507*.py 旧模型快照
+├── legacy_model_configuration/  # 旧版模型配置（含 models_260808.py、config.json）
 ├── data_process/                # 数据处理工具目录
 │   ├── process_parquet.py       # Parquet数据处理
 │   ├── extracting_json.py       # JSON数据提取
@@ -91,8 +93,7 @@ Pytorch_GPT/
 ├── hyperparameter_search_logs/  # 超参数搜索日志目录
 │   ├── best_params.json         # 最优参数配置
 │   └── search_results.json      # 搜索结果记录
-├── bpe_tokenizer_*.json         # 预训练分词器文件
-└── weight_initialization_comparison.png  # 权重初始化对比图
+└── experiments/                 # 对照实验脚本与结果（含权重初始化对比图等产物）
 ```
 
 ## 🚀 功能特性

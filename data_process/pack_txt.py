@@ -21,13 +21,13 @@ import random
 # }
 
 FILE_RATIO = {
-    r"data_sft256.txt": 1,
-    r"data_sft384.txt": 1,
-    # r"data_sft512.txt": 1
+    r"data/data_sft256.txt": 1,
+    r"data/data_sft384.txt": 1,
+    # r"data/data_sft512.txt": 1
 }
 
 # 输出文件路径
-OUTPUT_PATH = r"data_sft-256-384-merge.txt"
+OUTPUT_PATH = r"data/data_sft-256-384-merge.txt"
 
 # 随机种子，保证可复现；设为 None 则每次随机
 SEED = 42

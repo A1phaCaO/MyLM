@@ -36,7 +36,7 @@ class SearchConfig:
     """搜索配置参数"""
     # 数据配置
     data_dir: str = r"data_large_ChatML.txt"
-    tokenizer_dir: str = r"bpe_tokenizer_6k_0724_ChatML.json"
+    tokenizer_dir: str = r"tokenizer/bpe_tokenizer_6k_0724_ChatML.json"
     log_dir: str = r"hyperparameter_search_logs"
     padding_side = "left"
     

@@ -205,6 +205,20 @@ class PretrainTokenIDDataset(torch.utils.data.Dataset):
         self.perm = rng.permutation(self.n_samples).astype(np.int64)
         return self
 
+    def __getstate__(self):
+        """序列化时丢弃 memmap：numpy 2.x 的 memmap 已无自定义 __reduce__，
+        pickle 会把整个文件内容拷成 bytes（730MB 级），经 Windows spawn 管道
+        传输会触发 OSError: [Errno 22]。其余属性（indices/perm 等）照常序列化。
+        """
+        state = self.__dict__.copy()
+        state.pop("data", None)
+        return state
+
+    def __setstate__(self, state):
+        """反序列化时按 data_dir 重新打开 memmap（mmap 惰性映射，开销可忽略）。"""
+        self.__dict__.update(state)
+        self.data = np.load(self.data_dir, mmap_mode="r")
+
     def pad_seq(
         self,
         seq: np.ndarray,
@@ -298,10 +312,13 @@ class SFTTextDataset(torch.utils.data.Dataset):
         tokenizer_path: str,
         seq_max_len: int = 256,
         downsample: float = 1.0,
-        padding_side: str = "left",
+        padding_side: str = "right",
         pad_value: int = 0,
         shuffle_seed: Optional[int] = None,
-        assistant_prefix: str = "<|im_start|>assistant\n",
+        # 字面 \n（backslash+n）：SFT 数据文件用字面 \n 做消息分隔，
+        # tokenizer 的 ByteLevel 预分词器会把真实换行(0x0A)归为 <|unk|>(id=3)，
+        # 因此必须用字面 \n 才能正确匹配 assistant 前缀并保留有意义的 token
+        assistant_prefix: str = "<|im_start|>assistant\\n",
         mark_special_tokens: bool = True,
     ):
         super().__init__()
@@ -402,6 +419,46 @@ class SFTTextDataset(torch.utils.data.Dataset):
             samples = samples * int(downsample)
         self.samples = samples
 
+        # ---- 静默失效保护：确认数据格式与 SFT mask 约定一致 ----
+        # SFT mask 依赖「字面反斜杠-n」匹配 assistant 前缀；若数据误用真实换行(0x0A)，
+        # tokenizer 的 ByteLevel 会将其归为 <|unk|>(id=3)，前缀永远匹配不上 →
+        # 每个样本回答正文 mask 全 0 → 模型只训到结构特殊 token（灾难性且静默）。
+        # 构建期即拦下，避免 loss 照降、人看不出。
+        prefix = self.assistant_prefix_ids
+        if prefix is None or len(prefix) == 0:
+            raise ValueError(
+                "assistant_prefix 编码为空，无法生成 SFT mask；"
+                "请检查 tokenizer 是否注册了 <|im_start|> 等特殊 token"
+            )
+        im_start_id = self.tokenizer.token_to_id("<|im_start|>")
+        if im_start_id is None or int(im_start_id) not in prefix.tolist():
+            raise ValueError(
+                "assistant_prefix 未包含 <|im_start|> token，请检查 tokenizer 配置"
+            )
+        K = min(50, len(self.samples))
+        if K == 0:
+            raise ValueError("数据集为空（0 个样本），请检查数据文件与切分规则")
+        hit = 0
+        for si in range(K):
+            s, e = self.samples[si]
+            with open(self.data_dir, "rb") as f:
+                f.seek(s)
+                txt = f.read(e - s).decode("utf-8", errors="ignore")
+            ids = np.asarray(self.tokenizer.encode(txt).ids, dtype=np.int64)
+            if self._find_subseq(ids, prefix).size > 0:
+                hit += 1
+        if hit == 0:
+            raise RuntimeError(
+                f"SFT mask 自检失败：抽检 {K} 个样本中 0 个能匹配到 assistant 前缀 "
+                f"{prefix.tolist()}。极可能是数据用了真实换行而非字面 '\\n'。"
+                f"请确认 {self.data_dir} 的消息分隔符为字面反斜杠-n。"
+            )
+        if hit < K:
+            print(
+                f"[SFT 警告] 抽检 {K} 个样本仅 {hit} 个命中 assistant 前缀，"
+                f"其余可能无 assistant 回合或格式不规整。"
+            )
+
     def set_permute_seed(self, seed: int):
         """重设 shuffle 种子（每个 epoch 换新种子得到不同排列）。
         用独立 RandomState，不消耗训练全局 RNG。
@@ -442,12 +499,18 @@ class SFTTextDataset(torch.utils.data.Dataset):
     ):
         """ids 与其 loss mask 同步截断+填充（长度=seq_max_len+1，后续 [:-1]/[1:] 切片少 1）。
         mask 先于截断生成，保证保留尾部（assistant 回答）时 loss 标记不丢失。
+
+        SFT 截断策略：无论 pad 方向，始终左截断（保留尾部 = assistant 回答）。
+          - right pad：左截断 + 右填充 → pad 在尾部，causal mask 天然隔离，
+            不再依赖 seq_mask 的零假设（attn_bias 可学习偏置会破坏该假设）。
+          - left  pad：左截断 + 左填充（旧行为，保留兼容）。
         """
         max_len = self.seq_max_len + 1
         pad_v = self.pad_value
         if self.padding_side == "right":
-            ids = ids[:max_len]
-            mask = mask[:max_len]
+            # 左截断：保留尾部（assistant 回答）；右填充：pad 加在尾部
+            ids = ids[-max_len:]
+            mask = mask[-max_len:]
             if len(ids) < max_len:
                 n = max_len - len(ids)
                 ids = np.concatenate([ids, np.full(n, pad_v, dtype=ids.dtype)])
@@ -523,16 +586,13 @@ class SFTTextDataset(torch.utils.data.Dataset):
         with open(self.data_dir, "rb") as f:
             f.seek(start)
             text = f.read(end - start).decode("utf-8", errors="ignore").strip()
-        # 换行归一化：Windows CRLF 或裸 \r 会污染 BBPE 字节流，统一转 \n；
-        # 预处理常把消息换行转义为字面 \n（每行一个完整对话），还原为真实换行，
-        # 否则 assistant_prefix（真实 \n）匹配不到，回答区间将失去 loss 标记
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-        text = text.replace("\\n", "\n")
         if not text:
             # 空样本兜底：用 assistant 前缀而非 <|endoftext|>（id=0=pad，
             # _build_sft_mask 末尾 mask[seq==pad]=0 会把整个 mask 清零，
             # 导致样本静默零贡献）
-            text = "<|im_start|>assistant\n"
+            # 必须用字面 \n（与 assistant_prefix 一致）：真实换行(0x0A)会被
+            # tokenizer 编码为 <|unk|>(id=3)，前缀匹配不上、兜底 mask 失效
+            text = "<|im_start|>assistant\\n"
         ids = self.tokenizer.encode(text).ids
 
         # 在完整序列上生成 mask，再与 ids 同步截断+pad：
@@ -964,7 +1024,7 @@ if __name__ == "__main__":
     dataset = PretrainTextDataset(
         r"data_large_ChatML.txt",
         downsample=10,
-        tokenizer=tokenizers.Tokenizer.from_file(r"bpe_tokenizer_6k_0724_ChatML.json"),
+        tokenizer=tokenizers.Tokenizer.from_file(r"tokenizer/bpe_tokenizer_6k_0724_ChatML.json"),
         re_tokenize=False,
         # batch=True,
         seq_max_len=192,

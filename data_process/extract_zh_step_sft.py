@@ -9,14 +9,10 @@ import json
 import os
 from tqdm import tqdm
 
-INPUT_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "train_text", "RAW", "Step-SFT-chunk 99.json"
-)
-OUTPUT_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "train_text", "SFT", "step_sft_chunk99_zh_sft.txt"
-)
+INPUT_PATH = r"train_text\RAW\Step-SFT-chunk 97.json"
+OUTPUT_PATH = r"train_text\SFT\step_sft_chunk97_zh_sft.txt"
 
-CJK_RATIO_THRESHOLD = 0.5
+CJK_RATIO_THRESHOLD = 0.4
 
 
 def cjk_ratio(text):
