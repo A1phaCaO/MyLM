@@ -1401,8 +1401,8 @@ def section11():
     print("=" * 84)
 
     from dataset import PretrainTokenIDDataset
-    data_path = "mini_data192mixen_v3.npy" if os.path.exists("mini_data192mixen_v3.npy") \
-        else "medium_data256v2.npy"
+    data_path = "data/mini_data192mixen_v3.npy" if os.path.exists("data/mini_data192mixen_v3.npy") \
+        else "data/medium_data256v2.npy"
     seq_len = 192 if "mini" in data_path else 256
     print(f"  数据: {data_path}  seq={seq_len}  (vocab={VOCAB})")
 
@@ -1513,8 +1513,8 @@ def section12():
     print("=" * 84)
 
     from dataset import PretrainTokenIDDataset
-    data_path = "mini_data192mixen_v3.npy" if os.path.exists("mini_data192mixen_v3.npy") \
-        else "medium_data256v2.npy"
+    data_path = "data/mini_data192mixen_v3.npy" if os.path.exists("data/mini_data192mixen_v3.npy") \
+        else "data/medium_data256v2.npy"
     seq_len = 192 if "mini" in data_path else 256
     print(f"  数据: {data_path}  seq={seq_len}  (vocab={VOCAB}), 训练 B=32")
 

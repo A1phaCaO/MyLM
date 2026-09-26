@@ -20,6 +20,10 @@ from typing import Optional, Dict, Any
 # ---------------------------------------------------#
 #   工具组件
 # ---------------------------------------------------#
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # 仓库根（legacy/scripts/ 上两级）
+
 from utils import model_structure, TextGenerator, WarmUpCosineLR, DebugTimer
 from dataset import PretrainTextDataset
 from models_250830 import MyLM, MyLMArgs
@@ -34,8 +38,8 @@ class TrainingConfig:
     """训练配置参数"""
 
     # 数据配置
-    data_dir: str = r"data_sft.txt"
-    tokenizer_dir: str = r"bpe_tokenizer_6k_0724_ChatML.json"
+    data_dir: str = r"data/data_sft.txt"
+    tokenizer_dir: str = r"tokenizer/bpe_tokenizer_6k_0724_ChatML.json"
     model_save_dir: str = r"model\model_sft.pth"
     ckpt_save_dir: str = r"ckpt\ckpt.pth"
     log_dir: str = r"logs"

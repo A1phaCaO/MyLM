@@ -2,7 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import sys
+from pathlib import Path
 from typing import Optional, Tuple
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # 仓库根（tools/checks/ 上两级）
 from models import MyLMArgs
 
 

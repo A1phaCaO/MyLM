@@ -70,23 +70,23 @@ class TrainingConfig:
     """训练配置参数"""
 
     # 数据配置
-    data_dir: str = r"medium_data256v2.npy"
-    tokenizer_dir: str = r"bbpe_tokenizer_7k_260723_xl.json"
-    model_save_dir: str = r"model\model_xl.pth"
+    data_dir: str = r"data/medium_data256v3.npy"
+    tokenizer_dir: str = r"tokenizer/bbpe_tokenizer_7k_260723_xl.json"
+    model_save_dir: str = r"model\model_dense_m_0813v2.pth"
     ckpt_save_dir: str = r"ckpt\ckpt.pth"
-    config_save_dir: str = r"model\config_xl.json"
-    log_dir: str = r"logs/" +"xl3_"+ time.strftime("%Y%m%d-%H%M%S")
+    config_save_dir: str = r"model\config_dense_m_0813v2.json"
+    log_dir: str = r"logs/" +"dense_m_v2_"+ time.strftime("%y%m%d-%H%M")
     # log_dir: str = r"logs\xl2_20260809-190755"
     padding_side = "right"
 
     # 训练参数
     seed: int = 42
     epochs: int = 1
-    batch_size: int = 48
-    batch_acceleration: int = 4
+    batch_size: int = 64
+    batch_acceleration: int = 2
     dataset_downsample: int = 1
-    valset_rate: float = 0.0017
-    val_interval_step: int = 1000
+    valset_rate: float = 0.0016
+    val_interval_step: int = 2000
     seq_max_len = 256   # 对齐 v3 存储长度 257 (=256+1)，loader 零 pad
     use_compile: bool = True
     # "max-autotune" or "default" or "reduce-overhead"
@@ -97,24 +97,24 @@ class TrainingConfig:
     exclude_moe_from_compile: bool = False
 
     # 优化参数
-    learning_rate: float = 4e-3
-    min_learning_rate: float = 4e-4  # WSD LRS衰减到峰值LR的10%
+    learning_rate: float = 5e-3
+    min_learning_rate: float = 5e-4  # WSD LRS衰减到峰值LR的10%
     lr_decay_start_rate: int = 0.75  # 最后衰减
-    warmup_steps: int = 6
+    warmup_steps: int = 5
     use_amp: bool = True
 
     model_args = MyLMArgs(
         d_model=512,
-        latent_moe=True,
+        latent_moe=False,
         d_latent=256,
-        d_inner=int(((256 * (8 / 3)) // 64) * 64),
+        d_inner=int(((512 * (8 / 3)) // 64) * 64),
         d_head=128,
         n_heads=None,
-        n_layers=8,
+        n_layers=6,
         vocab_size=None,
         seq_max_len=seq_max_len,
-        use_moe=True,
-        n_experts=12,
+        use_moe=False,
+        n_experts=8,
         n_experts_per_tok=2,
         d_conv=None,
         conv_bias=None,
@@ -125,7 +125,7 @@ class TrainingConfig:
     )
 
     # 新增参数：checkpoint保存间隔步数
-    ckpt_interval_step: int = 1000
+    ckpt_interval_step: int = 2000
     # checkpoint 自动清理：保留最近 ckpt_keep_recent 个，
     # 更早的每隔 ckpt_keep_stride 个保留 1 个（0 表示不清理）
     ckpt_keep_recent: int = 3
@@ -152,7 +152,7 @@ class PreTrainer:
             len(self.tokenizer.get_vocab()))
         self.train_loader, self.val_loader = self._build_dataloader()
         self.model = self._build_model().to(self.device)
-        self.criterion = nn.CrossEntropyLoss()
+        self.criterion = nn.CrossEntropyLoss(reduction="none")
         self.optimizers, self.schedulers = self._build_optimizer()
         self.scaler = torch.GradScaler(self.device, enabled=config.use_amp)
         self.generator = TextGenerator(
@@ -237,7 +237,10 @@ class PreTrainer:
             pin_memory=True,
             num_workers=6,
             prefetch_factor=4,
-            persistent_workers=True
+            # persistent_workers=False：每个 epoch 重新 spawn worker，
+            # 使 set_permute_seed(seed+epoch) 的新排列能传入 worker（M4）；
+            # 数据集 pickle 已由 PretrainTokenIDDataset.__getstate__ 瘦身，spawn 代价 ~1-2s
+            persistent_workers=False
         )
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
@@ -247,7 +250,7 @@ class PreTrainer:
             pin_memory=True,
             num_workers=4,
             prefetch_factor=3,
-            persistent_workers=True
+            persistent_workers=False
         )
 
         return train_loader, val_loader
@@ -492,11 +495,12 @@ class PreTrainer:
         random.setstate(rng_states["random"])
         np.random.set_state(rng_states["numpy"])
 
-    def _train_step(self, inputs, targets, mask, capture_grad_stats=False):
-        """单步训练（含梯度累加），返回 (loss, grad_norm, grad_stats)
-        - grad_norm: clip 前的梯度总范数，仅在累积完成 step 时计算，否则为 None
-        - grad_stats: dict {max_abs, mean_abs, zero_ratio, per_layer_norms(tensor)}，仅在
-                      capture_grad_stats=True 且 grad_norm 已计算时返回（此时梯度已 unscale），否则为 None
+    def _train_step(self, inputs, targets, mask):
+        """单步前向，返回 (num, den)：
+        - num: 该 micro-batch 所有有效 token 的 loss 总和（带 autograd 图，由 train() 立即 backward 累加）
+        - den: 该 micro-batch 有效 token 数
+        梯度累加（per-micro-batch backward）+ 边界处整体除以 Σden，使跨 micro-batch 的 loss
+        按「有效 token 数」加权，而非各 micro-batch 等权平均；同时保持显存只占单 micro-batch。
         """
         self.model.train()
         inputs = inputs.to(self.device)
@@ -504,50 +508,42 @@ class PreTrainer:
         mask = mask.to(self.device)
 
         with torch.autocast(str(self.device), enabled=self.config.use_amp, dtype=torch.bfloat16):
-            output = self.model(inputs)
-            # 计算交叉熵损失（不使用ignore_index，因为我们手动应用mask）
-            loss = self.criterion(
+            # 显式 padding mask：由 token id 判定真实 token（取代「pad 行隐藏态全零」的
+            # 隐式假设），左/右 padding 注意力屏蔽均正确；推理无 padding 时传 None。
+            output = self.model(inputs, padding_mask=(inputs != self.config.model_args.pad_id))
+            # 逐 token 交叉熵（reduction="none"），随后由 mask 加权
+            loss_per_token = self.criterion(
                 output.view(-1, self.config.model_args.vocab_size), targets.view(-1)
             )
-            # 应用mask：将mask展平并与损失相乘
-            loss = (loss * mask.view(-1)).sum() / mask.sum()
+            mask_f = mask.view(-1)
+            num = (loss_per_token * mask_f).sum()   # 该 micro-batch 有效 token 的 loss 总和（带图）
+            den = mask_f.sum()                        # 有效 token 数
+        return num, den
 
-        loss = loss / self.config.batch_acceleration
-
-        self.scaler.scale(loss).backward()
-
-        grad_norm = None
-        grad_stats = None
-        is_step_boundary = (
-            (self.current_step + 1) % self.config.batch_acceleration == 0
-        ) or (self.current_step + 1 == len(self.train_loader))
-        if is_step_boundary:
-            # 对每个优化器进行梯度缩放和更新
-            for optimizer in self.optimizers:
-                self.scaler.unscale_(optimizer)
-            # clip_grad_norm_ 返回 clip 前的梯度范数
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), 1.0
-            ).item()
-
-            # 捕获梯度统计（在 unscale 后、clip 前；此时为原始梯度）
-            if capture_grad_stats:
-                grad_stats = self._compute_grad_stats()
-
-            # 对每个优化器单独执行step
-            for optimizer in self.optimizers:
-                self.scaler.step(optimizer)
-            self.scaler.update()
-            # 对每个优化器单独清零梯度
-            # 注意: set_to_none=False 保持 .grad 缓冲稳定（配合 train() 中的预分配），
-            # 避免 CUDAGraph(torch.compile reduce-overhead) 梯度累积时报错
-            for optimizer in self.optimizers:
-                optimizer.zero_grad(set_to_none=False)
-            # 对每个调度器单独执行step
-            for scheduler in self.schedulers:
-                scheduler.step()
-
-        return loss.item() * self.config.batch_acceleration, grad_norm, grad_stats
+    def _optimizer_step(self, capture_grad_stats: bool):
+        """梯度累加边界：unscale + clip（可选梯度统计）+ step + update + zero_grad + 调度器 step。
+        返回 (grad_norm, grad_stats)。"""
+        for optimizer in self.optimizers:
+            self.scaler.unscale_(optimizer)
+        # clip_grad_norm_ 返回 clip 前的梯度范数
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), 1.0
+        ).item()
+        # 捕获梯度统计（在 unscale 后、clip 前；此时为原始梯度）
+        grad_stats = self._compute_grad_stats() if capture_grad_stats else None
+        # 对每个优化器单独执行 step
+        for optimizer in self.optimizers:
+            self.scaler.step(optimizer)
+        self.scaler.update()
+        # 对每个优化器单独清零梯度
+        # 注意: set_to_none=False 保持 .grad 缓冲稳定（配合 train() 中的预分配），
+        # 避免 CUDAGraph(torch.compile reduce-overhead) 梯度累积时报错
+        for optimizer in self.optimizers:
+            optimizer.zero_grad(set_to_none=False)
+        # 对每个调度器单独执行 step
+        for scheduler in self.schedulers:
+            scheduler.step()
+        return grad_norm, grad_stats
 
     def _compute_grad_stats(self):
         """计算当前梯度的统计量（需在 unscale 后、zero_grad 前调用）
@@ -751,6 +747,17 @@ class PreTrainer:
                 bar.update(self.start_step)
 
             self.current_epoch = epoch
+
+            # M4 修复：多 epoch 时每个 epoch 用 (seed + epoch) 重新打乱数据排列，
+            # 否则第 2 个 epoch 起数据顺序与第 1 个完全相同（DataLoader 用 shuffle=False，
+            # 且 set_permute_seed 只在 __init__ 调用一次）。种子含 epoch 保证续训可复现。
+            # 穿透 random_split 产生的 Subset 拿到底层 PretrainTokenIDDataset。
+            if self.config.dataset_shuffle_seed is not None:
+                base_ds = self.train_loader.dataset
+                while isinstance(base_ds, torch.utils.data.Subset):
+                    base_ds = base_ds.dataset
+                base_ds.set_permute_seed(self.config.dataset_shuffle_seed + epoch)
+
             train_loss_sum = 0
             last_val_step = -1  # 记录上次验证的 global_step，避免 epoch 末尾重复验证
             last_val_metrics = None  # 缓存上次 val 指标，epoch 末复用
@@ -765,6 +772,8 @@ class PreTrainer:
                     0,
                 )
 
+            acc_num = 0.0   # 累加组中有效 token 的 loss 分子（仅日志用，float；不再保留 autograd 图）
+            acc_den = 0      # 累加组中有效 token 数
             for i, (train_inputs, train_targets, train_mask) in enumerate(
                 self.train_loader
             ):
@@ -774,19 +783,42 @@ class PreTrainer:
                     continue
                 self.current_step = i
                 # 提前计算 need_val：基于 i 和 step 后的 global_step（即 global_step+1）
-                need_val = (i % self.config.val_interval_step == 0) or (
-                    (self.global_step + 1) % self.config.ckpt_interval_step == 0
-                )
+                need_val = ((i % self.config.val_interval_step == 0) or (
+                    (self.global_step) % self.config.ckpt_interval_step == 0
+                )) and i > 0
                 # 仅在需要记录时开启MoE统计，避免每步额外开销
                 if self.moe_collector is not None:
                     self.moe_collector.set_enabled(need_val)
-                loss, grad_norm, grad_stats = self._train_step(
-                    train_inputs, train_targets, train_mask,
-                    capture_grad_stats=need_val,
-                )
+                num, den = self._train_step(train_inputs, train_targets, train_mask)
                 if self.moe_collector is not None:
                     self.moe_collector.set_enabled(False)
 
+                # 跨 micro-batch 累加：每个 micro-batch 立即 backward（释放本 batch 的 autograd
+                # 图，显存只占 1 个 micro-batch），把「未归一化」的 num 梯度累加到 param.grad；
+                # 边界处整体除以 Σden，等价于对 Σnum/Σden 做一次 backward，但显存回到单 batch 水平
+                # （retain-graph 方案会因同时保留 batch_acceleration 个图导致 ~2x 显存暴涨）。
+                den_int = int(den.item())
+                acc_num += float(num.item())   # 仅日志用（有效 token loss 分子累加）
+                acc_den += den_int
+
+                self.scaler.scale(num).backward()
+
+                is_step_boundary = (
+                    (self.current_step + 1) % self.config.batch_acceleration == 0
+                ) or (self.current_step + 1 == len(self.train_loader))
+                if is_step_boundary:
+                    if acc_den > 0:
+                        # 把累加梯度除以 Σden，得到全局 token 加权的梯度（与 Σnum/Σden 的梯度一致）
+                        for p in self.model.parameters():
+                            if p.grad is not None:
+                                p.grad.div_(acc_den)
+                    grad_norm, grad_stats = self._optimizer_step(capture_grad_stats=need_val)
+                    loss = acc_num / max(acc_den, 1)   # 整组 token 加权 loss（日志）
+                    acc_num, acc_den = 0.0, 0
+                else:
+                    grad_norm = None
+                    grad_stats = None
+                    loss = float(num.item()) / max(den_int, 1)   # 单 micro-batch token 加权 loss（仅日志）
                 train_loss_sum += loss
                 self.train_loss_log.append((self.global_step, loss))
                 self.lr_log.append(
@@ -878,7 +910,7 @@ class PreTrainer:
                         self.global_step,
                     )
                     # 文本生成测试（打印到控制台 + 写入 TensorBoard）
-                    test_text = self.generate_test("人工智能是")
+                    test_text = self.generate_test("人工智能")
                     writer.add_text(
                         "GeneratedText",
                         f"epoch_{epoch}_step_{i}: {test_text}",
@@ -989,14 +1021,17 @@ class PreTrainer:
                 val_inputs = val_inputs.to(device)
                 val_targets = val_targets.to(device)
                 val_mask = val_mask.to(device)
-                with torch.autocast(str(device), enabled=self.config.use_amp):
-                    val_output = self.model(val_inputs)
+                with torch.autocast(str(device), enabled=self.config.use_amp, dtype=torch.bfloat16):
+                    val_output = self.model(
+                        val_inputs,
+                        padding_mask=(val_inputs != self.config.model_args.pad_id),
+                    )
                     logits = val_output.view(-1, vocab_size)
                     targets_flat = val_targets.view(-1)
                     mask_flat = val_mask.view(-1)
                     loss = self.criterion(logits, targets_flat)
-                    loss = (loss * mask_flat).sum() / mask_flat.sum()
-                loss_acc += loss.float()
+                    loss_num = (loss * mask_flat).sum()   # 该 batch 有效 token 的 loss 总和
+                    loss_acc += loss_num.float()          # 跨 batch 累加分子；分母用 total_tokens
 
                 # 计算 entropy / top-k accuracy（用 float32 精度，仅对有效 token）
                 probs = torch.softmax(logits.float(), dim=-1)
@@ -1036,9 +1071,9 @@ class PreTrainer:
                     **weight_stats,
                 },
             )
-        avg_loss = loss_acc.item() / n
-        ppl = math.exp(avg_loss)
         total = total_tokens.item()
+        avg_loss = loss_acc.item() / max(total, 1)   # 与训练一致：按有效 token 数全局加权
+        ppl = math.exp(avg_loss)
         avg_entropy = entropy_acc.item() / max(total, 1)
         top1_acc_val = top1_acc.item() / max(total, 1)
         top5_acc_val = top5_acc.item() / max(total, 1)
@@ -1097,11 +1132,15 @@ class PreTrainer:
             "per_layer_weight_norms": torch.tensor(layer_norms, dtype=torch.float32),
         }
 
-    def generate_test(self, start: str = "我", gen_len: int = 25, verbose: bool = True):
+    def generate_test(self, start: str = "今天", gen_len: int = 25, verbose: bool = True,
+                      temperature: float = 0.7, top_k: int = 20, top_p: float = None,
+                      repetition_penalty: float = 1.0, frequency_penalty: float = 1.5):
         """文本生成测试（返回文本；verbose=True 时打印到控制台）"""
         self.model.eval()
         ans = self.generator.generate(
-            start_token=start, gen_seq_len=gen_len, print_out=False
+            start_token=start, gen_seq_len=gen_len, print_out=False,
+            temperature=temperature, top_k=top_k, top_p=top_p,
+            repetition_penalty=repetition_penalty, frequency_penalty=frequency_penalty,
         )
         ans = ans[len(start):]  # 截掉start_token
         result = "".join(ans)

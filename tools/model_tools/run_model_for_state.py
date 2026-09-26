@@ -1,3 +1,7 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # 仓库根（tools/model_tools/ 上两级）
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,11 +12,10 @@ from tokenizers import Tokenizer  # 引入 tokenizers 库
 import tokenizers
 
 
-
 # 导入模型文件
 model_dir = r"model\model_xl_sft.pth"
-tokenizer_dir = r"bbpe_tokenizer_7k_260723_xl.json"
-config_dir = r"model\config_xl_0810.json"
+tokenizer_dir = r"tokenizer/bbpe_tokenizer_7k_260723_xl.json"
+config_dir = r"model\config_sft.json"  # SFT 模型用 SFT 配置（seq_max_len=512）
 
 with open(config_dir, 'r', encoding='utf-8') as f:
     config = json.load(f)
@@ -33,23 +36,23 @@ tokenizer = Tokenizer.from_file(tokenizer_dir)
 #             dropout=0.1,
 #         )
 args = m.MyLMArgs(
-            d_model=config['d_model'],
-            d_inner=config['d_inner'],
-            n_layers=config['n_layers'],
-            use_moe=config['use_moe'],
-            n_experts=config['n_experts'],
-            n_heads=config['n_heads'],
-            d_head=config['d_head'],
-            d_latent=config['d_latent'],
-            latent_moe=config['latent_moe'],
-            n_experts_per_tok=config['n_experts_per_tok'],
-            vocab_size=tokenizer.get_vocab_size(),
-            seq_max_len=config['seq_max_len'],
-            conv_bias=False,
-            ffn_bias=False,
-            attn_bias=True,
-            dropout=0,
-        )
+    d_model=config['d_model'],
+    d_inner=config['d_inner'],
+    n_layers=config['n_layers'],
+    use_moe=config['use_moe'],
+    n_experts=config['n_experts'],
+    n_heads=config['n_heads'],
+    d_head=config['d_head'],
+    d_latent=config['d_latent'],
+    latent_moe=config['latent_moe'],
+    n_experts_per_tok=config['n_experts_per_tok'],
+    vocab_size=tokenizer.get_vocab_size(),
+    seq_max_len=512,
+    conv_bias=False,
+    ffn_bias=False,
+    attn_bias=True,
+    dropout=0,
+)
 print(config)
 model = m.MyLM(args).to('cuda')
 model_structure(model)
@@ -79,7 +82,8 @@ if any(k.startswith(PREFIXES) for k in state_dict.keys()):
 # RoPE 的 cos_cached/sin_cached 是按当前 seq_max_len 预计算的 buffer，
 # 若 checkpoint 与当前模型 seq_max_len 不一致会导致 size mismatch。
 # 它们会在前向时按实际 seq_len 重新切片，删除后不影响加载与计算。
-rope_buffers = [k for k in state_dict if k.endswith("attn.cos_cached") or k.endswith("attn.sin_cached")]
+rope_buffers = [k for k in state_dict if k.endswith(
+    "attn.cos_cached") or k.endswith("attn.sin_cached")]
 if rope_buffers:
     for k in rope_buffers:
         del state_dict[k]
@@ -98,9 +102,12 @@ except Exception as e:
         print(f'未匹配参数：{unexpect}')
 
 test_generator = TextGenerator(model, tokenizer, 'cuda', padding_side="none")
-MAX_LEN = 256
-T=0.7
+MAX_LEN = 256  # 生成步数上限（SFT config seq_max_len 为 512，此处仅控制生成长度）
+T = 0.7
+TOP_P = 0.95         # 核采样，与 SFTTrainer.generate_test 对齐
+REP_P = 1.1          # 经典重复惩罚，与 SFTTrainer.generate_test 对齐
 INSTURCT_MODE = True
+_im_end_id = tokenizer.token_to_id("<|im_end|>")
 
 while True:
     if INSTURCT_MODE:
@@ -111,19 +118,29 @@ while True:
     if start[:2] == 'T=':
         T = float(start[2:])
         print(f'T={T}')
+    elif start[:2] == 'P=':
+        TOP_P = float(start[2:])
+        print(f'TOP_P={TOP_P}')
+    elif start[:2] == 'R=':
+        REP_P = float(start[2:])
+        print(f'REP_P={REP_P}')
     else:
+
         if INSTURCT_MODE:
-            start = f"<|im_start|>user\n{start}<|im_end|>\n<|im_start|>assistant\n"
-        print(f'temperature={T}\n' +
-            "".join(
-                test_generator.generate(
-                    start_token=start,
-                    gen_seq_len=MAX_LEN,
-                    temperature=T,
-                    top_k=20,
-                    # top_p=0.7,
-                    frequency_penalty=1.0,
-                    print_out=True
-                )
-            )
+            # 字面 \n 对齐 SFT 数据格式（tokenizer 把真实换行归为 <|unk|>）
+            prompt = f"<|im_start|>user\\n{start}<|im_end|>\\n<|im_start|>assistant\\n"
+        else:
+            prompt = start
+        raw_ans = test_generator.generate(
+            start_token=prompt,
+            gen_seq_len=MAX_LEN,
+            temperature=T,
+            top_k=20,
+            top_p=TOP_P,
+            repetition_penalty=REP_P,
+            frequency_penalty=0.5,
+            print_out=True,
+            eos_id=_im_end_id,
         )
+        print(
+            f"user: {start}\n{raw_ans.replace("\\n", "\n").split("assistant")[-1]}")

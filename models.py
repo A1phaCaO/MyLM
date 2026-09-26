@@ -31,6 +31,10 @@ class MyLMArgs:
     dropout: float = 0.1
     base_init_std: float = 0.02  # 基础初始化标准差
     emb_init_std: float = None   # embedding 标准差；None = base_init_std * 0.5（实验最优 embr=0.5）
+    pad_id: int = 0              # 用于构造显式 attention padding mask 的 token id；
+                                 # 本项目 SFT 复用 EOS(id=0) 作 pad，pretrain 也以 0 右填充，故默认 0。
+                                 # 取代「pad 行隐藏态全零」的隐式假设（attn_bias 的 o_proj.bias
+                                 # 会让 pad 行残差流在第 1 层后非零，导致原 seq_mask 失效）。
 
 
 class RMSNorm(torch.nn.Module):
@@ -47,8 +51,9 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x):
         input_dtype = x.dtype
-        x = x.to(torch.bfloat16)
-        variance = x.pow(2).mean(-1, keepdim=True)
+        # 方差在 fp32 中计算（LLaMA 约定），避免 bf16 累加的舍入噪声直接进入 rsqrt；
+        # 同时不再主动把 fp32 激活降成 bf16——use_amp=False 的对比实验数值口径才与正式训练一致。
+        variance = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * x.to(input_dtype)
 
@@ -463,19 +468,43 @@ class MoEFFN(nn.Module):
         top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
 
         # DeepSeek loss-free 负载均衡更新: 仅在训练时按负载差符号调整 bias
+        # 计数用 index_add_ 而非 torch.bincount: bincount 带 kwarg 在 dynamo
+        # 中不识别会 graph break, 恢复子图在训练(aot joint)下触发 torch 2.13
+        # _replay_alias 的 "shape '[]' is invalid" 崩溃
         if self.ds_gamma > 0 and self.training:
-            load = torch.bincount(
-                top_k_idx.reshape(-1), minlength=self.N).float()
+            ones = torch.ones_like(
+                top_k_idx.reshape(-1), dtype=torch.float32)
+            load = torch.zeros(
+                self.N, device=ones.device, dtype=torch.float32)
+            load.index_add_(0, top_k_idx.reshape(-1), ones)
             self.expert_bias.data.add_(
                 -self.ds_gamma * torch.sign(load - load.mean()))
 
         N, K, d = self.N, self.Kk, self.d
         B, S, _ = x.shape
         T = B * S
-        if self.MCap is None:
-            # 固定容量: 期望每专家装载 = T*K/N, 首个 forward 定下不再变
-            self.MCap = max(1, math.ceil((T * K / N) * self.kappa / 16) * 16)
-        M = self.MCap
+        if self.training:
+            # 训练: 容量由首个训练 batch 定下后固定（不随 step 变化，保持
+            # torch.compile 图稳定）。训练 batch 很大，容量充足、几乎不丢 token。
+            if self.MCap is None:
+                self.MCap = max(1, math.ceil((T * K / N) * self.kappa / 16) * 16)
+            M = self.MCap
+        else:
+            # 推理/验证: 优先复用训练 MCap——validate 的 batch 与训练同形状，
+            # 复用可避免 eval 容量小于实际装载导致大量 token 被丢弃、val 失真，
+            # 且与训练图同形状、不会触发重编译。
+            # 纯推理（如 run_model，MCap 未被训练定下）回退到「基于 seq_max_len」
+            # 的固定容量：与 T 无关、逐 step 形状恒定，对任意长度单序列
+            # （期望装载 = seq_max_len*K/N ≤ M）都充足、不丢 token。
+            # 关键修复——旧版 eval 分支无条件覆盖 self.MCap，任何 eval 前向
+            # （validate/generate_test）都把训练容量污染成 seq_max_len 容量，
+            # 之后训练分支 if self.MCap is None 永假，MoE 训练静默丢弃大量
+            # token（SFT 配置下约 94.5%），且批量验证自身同样丢弃大量 token。
+            M = self.MCap
+            if M is None:
+                M = max(
+                    1, math.ceil((self.args.seq_max_len * K / N) * self.kappa / 16) * 16
+                )
 
         # Latent 投影
         if self.args.latent_moe:
@@ -490,7 +519,11 @@ class MoEFFN(nn.Module):
         pair_idx = torch.arange(T * K, device=x.device)  # 展平对序号
         order = torch.argsort(pair_exp, stable=True)
         es = pair_exp[order]
-        counts = torch.bincount(es, minlength=N)
+        # 与上一处 bincount 同理, 用 index_add_ 计数 (保持 int64 以维持下游
+        # target = es.long()*M + pos_safe 的整型运算链)
+        ones = torch.ones_like(es, dtype=torch.long)
+        counts = torch.zeros(N, device=es.device, dtype=torch.long)
+        counts.index_add_(0, es, ones)
         cs = torch.cumsum(counts, dim=0)
         starts = cs - counts
         pos = pair_idx - starts.gather(0, es)      # 组内序号
@@ -549,22 +582,18 @@ class MyLMDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(args.d_model)
         self.post_attention_layernorm = RMSNorm(args.d_model)
 
-    def forward(self, x: torch.Tensor, token_ids=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, token_ids=None, padding_mask=None) -> torch.Tensor:
         # 注意力部分
         residual = x
         x = self.input_layernorm(x)
-        seq_len = x.shape[1]  # 获取序列长度
-        # 创建padding mask：同时屏蔽 key 和 query 维的 pad 位置。
-        # 只屏蔽 key 维时，左 padding（padding_side="left"）下 pad 位置的 query 行
-        # 全部 key 被 -inf 屏蔽，softmax 产生 NaN 并经残差继续传播。
-        seq_mask = (x.sum(dim=-1) != 0)  # (batch_size, seq_len)
-        key_mask = seq_mask.unsqueeze(1).unsqueeze(
-            2)  # (batch_size, 1, 1, seq_len)
-        query_mask = seq_mask.unsqueeze(1).unsqueeze(
-            -1)  # (batch_size, 1, seq_len, 1)
-        # 广播为 (batch_size, 1, seq_len, seq_len)
-        pad_mask = (key_mask & query_mask).bool()
-        x = self.attn(x, token_ids=token_ids, mask=pad_mask)
+        # padding_mask: (batch_size, seq_len) bool，True=真实 token；由 MyLM.forward
+        # 从输入 token id 用 (id != pad_id) 显式构造后逐层传入，取代原先
+        # seq_mask = (x.sum(-1) != 0) 的「pad 行隐藏态全零」隐式假设。
+        # 该假设在 attn_bias=True 时因 o_proj.bias 可训练而在第 1 层起失效，
+        # 导致左 padding 下 pad 行被误判为有效 token、深度参与全部层注意力
+        # （即 code review 中的 S2 污染）。显式 mask 与隐藏态是否为零无关，
+        # 左/右 padding 均正确；padding_mask=None 时仅用 causal mask（推理无 padding）。
+        x = self.attn(x, token_ids=token_ids, mask=padding_mask)
         x = residual + x
 
         # MLP部分
@@ -637,23 +666,37 @@ class MyLM(nn.Module):
         # if isinstance(module, nn.Embedding):
         #     torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, x: torch.Tensor, token_ids=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, token_ids=None, padding_mask=None) -> torch.Tensor:
         """
         前向传播
 
         Args:
-            x: 输入张量，形状为(batch_size, seq_len)
-            token_ids: token ID，用于某些特殊操作
+            x: 输入张量（token id），形状为(batch_size, seq_len)
+            token_ids: token ID，保留位（当前未使用），与 x 相同
+            padding_mask: 可选，(batch_size, seq_len) 的 bool 张量，True=真实 token。
+                由调用方用 (x != pad_id) 构造后传入；为 None 时仅使用 causal mask
+                （推理无 padding 场景）。该显式 mask 取代原先依赖「pad 行隐藏态全零」
+                的隐式 padding 屏蔽，使左/右 padding 下的注意力屏蔽都正确无误。
 
         Returns:
             输出张量，形状为(batch_size, seq_len, vocab_size)
         """
+        # 显式 attention padding mask：同时屏蔽 key 与 query 维的 pad 位置。
+        # 只屏蔽 key 维时，左 padding 下 pad 位置的 query 行全部 key 被 -inf 屏蔽，
+        # softmax 产生 NaN 并经残差继续传播，故 key/query 双向屏蔽。
+        if padding_mask is not None:
+            key_mask = padding_mask.unsqueeze(1).unsqueeze(2)    # (B, 1, 1, S)
+            query_mask = padding_mask.unsqueeze(1).unsqueeze(-1)  # (B, 1, S, 1)
+            attn_pad_mask = (key_mask & query_mask).bool()        # (B, 1, S, S)
+        else:
+            attn_pad_mask = None
+
         # 词嵌入
         x = self.token_embedding(x)  # (batch_size, seq_len, d_model)
 
         # 通过Transformer块
         for block in self.blocks:
-            x = block(x, token_ids=token_ids)
+            x = block(x, token_ids=token_ids, padding_mask=attn_pad_mask)
 
         # 最终归一化和输出投影
         x = self.norm(x)
@@ -676,9 +719,9 @@ if __name__ == "__main__":
         use_moe=False,
         dropout=0.1,
         base_init_std=0.02,  # 基础初始化标准差
-        resid_scale=1.0,  # 残差流缩放
-        layer_scale=1.0,  # 层缩放
-        use_deepnet_scaling=True,  # 使用DeepNet缩放
+        latent_moe=0,        # DeepNet 残差缩放已内置于 _reset_parameters
+        d_latent=64,
+        pad_id=0,
     )
 
     # 实例化模型
@@ -705,6 +748,24 @@ if __name__ == "__main__":
     print(f"输出形状: {outputs.shape}")
     print(f"模型参数总数: {sum(p.numel() for p in model.parameters())}")
 
+    # padding mask 隔离回归：左 padding 下真实 token 不应受 pad 内容影响。
+    # 这是此前 seq_mask 零值假设失效（attn_bias 的 o_proj.bias 使 pad 行残差流
+    # 第 1 层后非零，左右 pad 均污染注意力）的根因回归守卫。
+    # 注：必须在 eval() 下比较数值——train 模式的 dropout 会让两次独立前向
+    # 产生随机差异，与 pad 无关。
+    model.eval()
+    with torch.no_grad():
+        a = torch.tensor([[10, 20, 5, 6, 7]])
+        b = torch.tensor([[30, 40, 5, 6, 7]])
+        pm = torch.tensor([[False, False, True, True, True]])  # 前两位是 pad
+        oa = model(a, padding_mask=pm)
+        ob = model(b, padding_mask=pm)
+        leak = (oa[0, 2:] - ob[0, 2:]).abs().max().item()
+        assert leak < 1e-5, f"padding mask 未隔离 pad 内容，泄漏 {leak}"
+        # 无 mask 时仅 causal（推理路径），不应抛错
+        _ = model(torch.tensor([[5, 6, 7]]))
+    print("padding mask 隔离测试通过!")
+
     # 测试不同的缩放参数
     print("\n测试不同缩放参数...")
     args_scaled = MyLMArgs(
@@ -717,9 +778,9 @@ if __name__ == "__main__":
         use_moe=False,
         dropout=0.1,
         base_init_std=0.02,
-        resid_scale=0.5,  # 测试较小的残差缩放
-        layer_scale=1.0,
-        use_deepnet_scaling=True,
+        latent_moe=0,
+        d_latent=64,
+        pad_id=0,
     )
 
     model_scaled = MyLM(args_scaled)

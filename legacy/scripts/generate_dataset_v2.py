@@ -5,7 +5,7 @@ import os
 import random
 
 # 加载tokenizer
-TOKENIZER_PATH = r"bbpe_tokenizer_7k_260723_xl.json"
+TOKENIZER_PATH = r"tokenizer/bbpe_tokenizer_7k_260723_xl.json"
 tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
 
 
@@ -66,7 +66,7 @@ SPLIT_SYMBOL = (
     "?",
 )
 SPLIT_FROM_SYMBOL = True
-OUTPUT_PATH = r"mini_data192hqbbpe.txt"
+OUTPUT_PATH = r"data/mini_data192hqbbpe.txt"
 SHUFFLE = True  # 按BATCH_SIZE进行随机打乱
 # BOS/EOS 配置常量（可修改）
 BOS_TOKEN_STR = ""  # BOS token 字符串

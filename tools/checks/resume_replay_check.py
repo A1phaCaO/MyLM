@@ -9,6 +9,10 @@ Part 2 (真实数据): 恢复真实 ckpt CPU RNG 后, loader 产出的 batch 首
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # 仓库根（tools/checks/ 上两级）
+
 import random
 import time
 import numpy as np
@@ -17,7 +21,7 @@ import torch.utils.data
 from dataset import PretrainTokenIDDataset
 
 SEED = 42
-DATA_DIR = r"medium_data256v2.npy"
+DATA_DIR = r"data/medium_data256v2.npy"
 SEQ_MAX_LEN = 256
 BATCH_SIZE = 48
 VALSET_RATE = 0.0018

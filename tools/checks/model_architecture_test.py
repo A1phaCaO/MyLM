@@ -9,6 +9,10 @@ from datetime import datetime
 from dataclasses import dataclass, asdict, field
 from typing import Optional, Dict, Any, Union, Type
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # 仓库根（tools/checks/ 上两级）
+
 from utils import model_structure
 from dataset import PretrainTextDataset
 from models import MyLM, MyLMArgs
@@ -21,8 +25,8 @@ class ModelTestConfig:
     """模型测试配置参数"""
 
     # 数据配置
-    data_dir: str = r"nano_test_data180.txt"
-    tokenizer_dir: str = r"bpe_tokenizer_6k_0724_ChatML.json"
+    data_dir: str = r"data/nano_test_data180.txt"
+    tokenizer_dir: str = r"tokenizer/bpe_tokenizer_6k_0724_ChatML.json"
     log_dir: str = r"logs"
     dataset_downsample: float = 1
     seq_max_len: int = 180

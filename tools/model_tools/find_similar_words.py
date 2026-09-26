@@ -1,3 +1,7 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # 仓库根（tools/model_tools/ 上两级）
+
 import torch
 import torch.nn.functional as F
 import json
@@ -6,7 +10,7 @@ import models as m
 
 # 路径常量
 MODEL_DIR = r"model\model_state_0724.pth"
-TOKENIZER_DIR = r"bbpe_tokenizer_7k_260723_xl.json"
+TOKENIZER_DIR = r"tokenizer/bbpe_tokenizer_7k_260723_xl.json"
 CONFIG_DIR = r"model\config_0724.json"
 TOP_K = 10
 

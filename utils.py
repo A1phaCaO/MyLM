@@ -15,28 +15,20 @@ class TextGenerator:
         model: nn.Module,
         tokenizer: tokenizers.Tokenizer,
         device,
-        padding_side="right",
+        padding_side="none",  # generate() 的默认 padding 方向（调用方可覆盖）
     ) -> None:
-        assert padding_side in ["right", "left", "none"], "padding_side应为'right'或'left'或'none'"
         self.tokenizer = tokenizer
         self.device = device
-        # self.padding_side = padding_side
+        self.padding_side = padding_side
         if isinstance(model, nn.DataParallel):
             print("该模型使用了DataParallel")
             self.model = model.module
         else:
             self.model = model
         self.seq_max_len = self.model.args.seq_max_len
-        self.padding_side = padding_side
-        if padding_side != "none":
-            self.tokenizer.enable_padding(direction=padding_side, length=self.seq_max_len, pad_id=0, pad_token="")
-            self.tokenizer.enable_truncation(
-                max_length=self.seq_max_len, direction=padding_side
-            )
-        elif padding_side == "none":
-            self.tokenizer.enable_truncation(
-                max_length=self.seq_max_len, direction="left"
-            )
+        # 不再变异共享 tokenizer（旧版 enable_padding/enable_truncation 会污染
+        # 同一实例的后续 encode 调用；SFTTextDataset 为此不得不独立加载 tokenizer）。
+        # 截断在 generate() 中手动处理。
 
     def generate(
         self,
@@ -45,62 +37,146 @@ class TextGenerator:
         temperature=0.7,
         frequency_penalty=1.5,
         top_k=20,
+        top_p=None,
+        repetition_penalty=1.0,
         print_out=True,
+        eos_id=None,
+        padding_side=None,
     ):
+        """自回归生成。
+
+        vs 旧版修复：
+        - 维护 token ID 列表，不再每步 re-encode 全串（避免 BBPE 跨边界重切分
+          导致 token 序列漂移）
+        - 整体 decode（增量打印），避免逐 token decode 产生 BBPE 残缺字节 �
+        - bf16 autocast 对齐训练精度
+        - 可选 eos_id 停止（SFT 传 <|im_end|> id）
+
+        Args:
+            padding_side: 默认取构造时传入的值（"none"）；"none" = 仅尾部截断、
+                （纯 causal）；"left" = 左 pad 到 seq_max_len；"right" = 右 pad
+                到 seq_max_len。后两者显式构造布尔 padding_mask 传入模型
+                （key/query 双向屏蔽，pad 位置不参与注意力）。显式 mask 按
+                pad 位置构造、而非 (id != pad_id) 推断，避免真实 EOS(id=0)
+                被误判为 pad。右 pad 时 logits 取最后一个真实 token 位置。
+
+        Returns:
+            str: 完整解码文本（旧版返回 list[str]，调用方 "".join() 对 str 同样兼容）
+        """
         with torch.no_grad():
+            if padding_side is None:
+                padding_side = self.padding_side
             self.model.eval()
-            tokens = [start_token]  # 无padding
-            # 初始化全序列ID列表（包含start_token）
-            all_token_ids = self.tokenizer.encode(start_token).ids
+            token_ids = list(self.tokenizer.encode(start_token).ids)
+            pad_id = self.model.args.pad_id
+            prev_decoded = self.tokenizer.decode(
+                token_ids, skip_special_tokens=False)
 
             for i in range(gen_seq_len):
+                # 截断到 seq_max_len（保留尾部 = 最新上下文）
+                context = token_ids[-self.seq_max_len:]
+                n_ctx = len(context)
 
-                all_token_ids = self.tokenizer.encode("".join(tokens)).ids
-                # 模型前向传播
-                input_tensor = (
-                    torch.tensor(all_token_ids).int().unsqueeze(0).to(self.device)
-                )
-                out = self.model(input_tensor)
-
-                # 根据padding方向选择logits位置
-                if self.padding_side == "right":
-                    logits = out[0, len(tokens) - 1, :]
-                elif self.padding_side in ("left", "none"):
-                    logits = out[0, -1, :]
+                if padding_side == "none" or n_ctx >= self.seq_max_len:
+                    # 无 pad：仅 causal mask（推理无 padding）
+                    input_tensor = torch.tensor(
+                        [context], dtype=torch.long, device=self.device
+                    )
+                    padding_mask = None
+                    logits_pos = -1
                 else:
-                    raise ValueError("padding_side must be 'right' or 'left'")
+                    pad_len = self.seq_max_len - n_ctx
+                    if padding_side == "left":
+                        ids = [pad_id] * pad_len + context
+                        valid = [False] * pad_len + [True] * n_ctx
+                    elif padding_side == "right":
+                        ids = context + [pad_id] * pad_len
+                        valid = [True] * n_ctx + [False] * pad_len
+                    else:
+                        raise ValueError(
+                            f"padding_side 必须是 'none'/'left'/'right'，got {padding_side}"
+                        )
+                    input_tensor = torch.tensor(
+                        [ids], dtype=torch.long, device=self.device
+                    )
+                    padding_mask = torch.tensor(
+                        [valid], dtype=torch.bool, device=self.device
+                    )
+                    # 右 pad 时最后一个位置是 pad，logits 取最后一个真实 token
+                    logits_pos = n_ctx - 1 if padding_side == "right" else -1
 
-                # 频率惩罚（修复后）
+                with torch.autocast(
+                    str(self.device), enabled=True, dtype=torch.bfloat16
+                ):
+                    out = self.model(input_tensor, padding_mask=padding_mask)
+                logits = out[0, logits_pos, :].float()
+
+                # 经典重复惩罚（repetition_penalty，HuggingFace 风格）：
+                # 对上下文里出现过的 token 直接缩放其 logits，抑制已经说过的词。
+                # 与 frequency_penalty 互补——后者按出现频次线性减分，
+                # 前者是乘性且对频次不敏感，更稳。
+                if repetition_penalty != 1.0:
+                    for prev_id in set(context):
+                        if logits[prev_id] > 0:
+                            logits[prev_id] /= repetition_penalty
+                        else:
+                            logits[prev_id] *= repetition_penalty
+
+                # 频率惩罚（按相对频率归一化：penalty = 出现频率 × 系数。
+                # 旧实现 penalty = counts × 系数，长上下文下 counts 随序列增长
+                # 累积，高频词 logits 被减几十导致完全被抑制、输出退化，
+                # 而短上下文下惩罚又几乎为 0，效果随输入长度剧烈波动）
                 if frequency_penalty != 0:
-                    # 使用当前全序列计算频率
-                    tokens_tensor = torch.tensor(all_token_ids, device=self.device)
-                    unique, counts = torch.unique(tokens_tensor, return_counts=True)
-
-                    # 创建惩罚张量（与logits同设备）
+                    ctx_tensor = torch.tensor(context, device=self.device)
+                    unique, counts = torch.unique(
+                        ctx_tensor, return_counts=True)
                     penalty = torch.zeros_like(logits)
-                    penalty[unique] = counts.float() * frequency_penalty
+                    penalty[unique] = (
+                        counts.float() * frequency_penalty / max(len(context), 1)
+                    )
                     logits = logits - penalty
 
-                # top_k 处理
+                # top_p 核采样（nucleus）：按概率从高到低累加，截掉累计超过
+                # top_p 的尾部 token；至少保留概率最高的 1 个，避免全 -inf。
+                if top_p is not None and 0.0 < top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(
+                        logits, descending=True)
+                    cumulative_probs = torch.cumsum(
+                        F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_to_remove = cumulative_probs > top_p
+                    sorted_to_remove[0] = False
+                    logits[sorted_indices[sorted_to_remove]] = -float("Inf")
+
+                # top_k
                 if top_k is not None and top_k > 0:
-                    # 获取 top_k 以外的 token 索引
+                    k = min(top_k, logits.size(-1))
                     indices_to_remove = (
-                        logits < torch.topk(logits, top_k)[0][..., -1, None]
+                        logits < torch.topk(logits, k)[0][..., -1, None]
                     )
                     logits[indices_to_remove] = -float("Inf")
 
-                # 采样下一个token
+                # 采样
                 probabilities = F.softmax(logits / temperature, dim=-1)
-                next_token_id = probabilities.multinomial(num_samples=1).item()
+                next_token_id = probabilities.multinomial(
+                    num_samples=1).item()
 
-                # 更新序列
-                tokens.append(
-                    self.tokenizer.decode([next_token_id], skip_special_tokens=False)
-                )
+                # EOS 停止
+                if eos_id is not None and next_token_id == eos_id:
+                    break
+
+                token_ids.append(next_token_id)
+
                 if print_out:
-                    print(tokens[-1], end=" ", flush=True)
+                    # 增量 decode：整体解码后取 diff，正确处理多字节 BBPE token
+                    new_decoded = self.tokenizer.decode(
+                        token_ids, skip_special_tokens=False)
+                    print(new_decoded[len(prev_decoded):], end="", flush=True)
+                    prev_decoded = new_decoded
 
-            return tokens
+            if print_out:
+                print()
+
+            return self.tokenizer.decode(token_ids, skip_special_tokens=False)
 
 
 class DebugTimer:

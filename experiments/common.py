@@ -45,8 +45,8 @@ class ExperimentConfig:
     """小规模实验配置（对齐 TrainingConfig 的字段含义，仅规模缩小）"""
 
     # 数据
-    data_dir: str = str(ROOT / "mini_data192mixen_v3.npy")
-    tokenizer_dir: str = str(ROOT / "bbpe_tokenizer_7k_260723_xl.json")
+    data_dir: str = str(ROOT / "data/mini_data192mixen_v3.npy")
+    tokenizer_dir: str = str(ROOT / "tokenizer/bbpe_tokenizer_7k_260723_xl.json")
     downsample: float = 0.02       # 数据集采样率（~21k 条，与模型尺寸匹配，避免快速过拟合）
     batch_size: int = 128          # dense 小模型，显存余量足，取大批量提速
     batch_acceleration: int = 4    # 梯度累积，有效 batch = 256

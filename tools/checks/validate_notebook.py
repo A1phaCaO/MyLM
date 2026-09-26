@@ -1,9 +1,11 @@
 import json
 import sys
+from pathlib import Path
 
-# Read and validate the notebook file
+# Read and validate the notebook file (仓库根 notebooks/ 下，脚本可从任意 cwd 运行)
+NOTEBOOK_PATH = Path(__file__).resolve().parents[2] / 'notebooks' / 'pre_train_notebook.ipynb'
 try:
-    with open('pre_train_notebook.ipynb', 'r', encoding='utf-8') as f:
+    with open(NOTEBOOK_PATH, 'r', encoding='utf-8') as f:
         content = f.read()
         print(f'File read successfully. Length: {len(content)} characters')
         

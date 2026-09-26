@@ -32,22 +32,23 @@ class TrainingConfig:
     # 数据配置
     # SFT 数据：每行 = 一段 ChatML 对话（未预分词），格式示例：
     #   "<|im_start|>user\n问题内容<|im_end|>\n<|im_start|>assistant\n回答内容<|im_end|>\n"
-    data_dir: str = r"data_sft-256-384-512-merge.txt"
-    tokenizer_dir: str = r"bbpe_tokenizer_7k_260723_xl.json"
-    model_save_dir: str = r"model\model_xl_sft.pth"
+    data_dir: str = r"data/data_sft512v3.txt"
+    tokenizer_dir: str = r"tokenizer/bbpe_tokenizer_7k_260723_xl.json"
+    model_save_dir: str = r"model\model_m_sftv2.pth"
     ckpt_save_dir: str = r"ckpt\sft_ckpt.pth"
-    config_save_dir: str = r"model\config_sft.json"
-    log_dir: str = r"logs/" + "sft4_" + time.strftime("%Y%m%d-%H%M%S")
-    padding_side: str = "left"   # 左 pad：截断时保留对话尾部（assistant 回答）
+    config_save_dir: str = r"model\config_m_sftv2.json"
+    log_dir: str = r"logs/sft/" +"sft_m_v2"+ time.strftime("%y%m%d-%H%M")
+    padding_side: str = "right"   # 右 pad：左截断保留回答尾部 + pad 加在尾部，
+    #                                 causal mask 天然隔离 pad，不再依赖 seq_mask 零假设
 
     # 训练参数
     seed: int = 42
-    epochs: int = 1
-    batch_size: int = 24
-    batch_acceleration: int = 3
+    epochs: int = 2
+    batch_size: int = 32
+    batch_acceleration: int = 1
     dataset_downsample: float = 1.0   # (0,1)=降采样, 1=全量, >1=重复（SFTTextDataset 语义）
     valset_rate: float = 0.01
-    val_interval_step: int = 300
+    val_interval_step: int = 500
     seq_max_len: int = 512   # 与 xl pretrain 模型一致
     use_compile: bool = True
     compile_mode: str = "max-autotune"
@@ -56,22 +57,22 @@ class TrainingConfig:
 
     # 优化参数（SFT 微调远小于 pretrain 的 4e-3）
     learning_rate: float = 1e-4
-    min_learning_rate: float = 1e-5   # WSD 衰减到峰值LR的10%
+    min_learning_rate: float = 1e-5   # WSD 衰减到峰值 LR 的 50%（若需按项目约定衰减到 10% 改为 1e-5）
     lr_decay_start_rate: int = 0.8    # 最后 20% 步数线性衰减
-    warmup_steps: int = 5
+    warmup_steps: int = 2
     use_amp: bool = True
 
     model_args = MyLMArgs(
         d_model=512,
-        latent_moe=True,
+        latent_moe=False,
         d_latent=256,
-        d_inner=640,
+        d_inner=int(((512 * (8 / 3)) // 64) * 64),
         d_head=128,
         n_heads=None,
-        n_layers=8,
+        n_layers=6,
         vocab_size=None,
         seq_max_len=seq_max_len,
-        use_moe=True,
+        use_moe=False,
         n_experts=12,
         n_experts_per_tok=2,
         d_conv=None,
@@ -93,42 +94,25 @@ class TrainingConfig:
     dataset_shuffle_seed: Optional[int] = 42
 
     # SFT 特有：从 pretrain 权重开始微调（纯权重文件或完整 checkpoint 均可）
-    train_from: Optional[str] = r"model\model_xl_0810.pth"
+    train_from: Optional[str] = r"model\model_dense_m_0813v2.pth"
 
 
 class SFTTrainer(PreTrainer):
     def __init__(self, config: TrainingConfig):
         super().__init__(config)
-        # PreTrainer 的 criterion 是默认 reduction="mean"，SFT 的 mask 稀疏
-        # （只有 assistant 回答 + 特殊 token 计 loss），必须 reduction="none"，
-        # 由 _train_step/validate 中的 mask 加权（两者均已实现）
+        # 与父类一致：criterion 用 reduction="none"（父类 PreTrainer 已是如此），
+        # 由 mask 对有效 token 加权，归一化在 _train_step / validate 内按有效 token 数完成。
         self.criterion = nn.CrossEntropyLoss(reduction="none")
         # 从 pretrain 权重继续训练（宽松加载，见 load_checkpoint）。
         # 与 resume_from 互斥：resume 的完整训练状态已含权重，再用 train_from
         # 覆盖会导致"权重=pretrain、优化器=恢复态"的混合状态
         if config.train_from is not None and config.resume_from is None:
             self.load_checkpoint(config.train_from)
-        self._zero_pad_embedding()
-
-    def _zero_pad_embedding(self):
-        """把 pad token 的 embedding 行显式置零。
-
-        models.py 的 attention padding mask 依赖「pad 行隐藏状态为 0」
-        （seq_mask = x.sum(-1) != 0），但 embedding 是随机初始化、pad 行并非零向量，
-        导致该 mask 从未生效。pretrain 右 padding 时 pad 在尾部、causal mask
-        天然隔离，无实际影响；SFT 是左 padding，pad 在前端会污染所有真实
-        token 的注意力。置零后（RMSNorm 有 eps，0 行输出仍为 0）seq_mask
-        才能正确屏蔽 pad 位置。
-        pad 复用 <|endoftext|>（id=0，对齐 Qwen：EOS=pad 同一 token）；
-        <|pad|>(id=2) 是 tokenizer 保留字段，不用于训练。
-        必须在 load_checkpoint 之后执行（加载会覆盖权重）。
-        """
-        pad_id = self.tokenizer.token_to_id("<|endoftext|>")
-        if pad_id is None:
-            return
-        with torch.no_grad():
-            self.model.token_embedding.weight.data[pad_id].zero_()
-        print(f"[sft] pad token (id={pad_id}, <|endoftext|>) embedding 已置零")
+        # 不再需要 _zero_pad_embedding：SFT 已改为右 padding，pad 在尾部，
+        # causal mask 天然隔离，不依赖 seq_mask 的零假设。
+        # （旧版左 padding 时置零 embedding 行试图让 seq_mask 生效，但
+        #  attn_bias=True 的 o_proj 可学习偏置会在训练几步后使 pad 行
+        #  残差流非零，从第 2 层起 seq_mask 失效——置零只是安慰剂。）
 
     def _build_dataloader(self):
         """构建数据加载器（SFT mask 数据集）"""
@@ -154,7 +138,7 @@ class SFTTrainer(PreTrainer):
             shuffle=False,
             drop_last=True,   # 保证 batch 形状恒定（torch.compile reduce-overhead 稳定）
             pin_memory=True,
-            num_workers=6,
+            num_workers=4,
             prefetch_factor=4,
             persistent_workers=True
         )
@@ -163,8 +147,8 @@ class SFTTrainer(PreTrainer):
             batch_size=self.config.batch_size,
             shuffle=True,
             drop_last=True,
-            pin_memory=True,
-            num_workers=4,
+            pin_memory=False,
+            num_workers=2,
             prefetch_factor=3,
             persistent_workers=True
         )
@@ -256,21 +240,28 @@ class SFTTrainer(PreTrainer):
 
     def generate_test(self, start: str = "你好", gen_len: int = 80,
                       temperature: float = 0.7, top_k: int = 20,
+                      top_p: float = 0.95, repetition_penalty: float = 1.1,
                       frequency_penalty: float = 1.0, verbose: bool = True):
-        """对话式生成测试：包装成 ChatML 并截断到 <|im_end|> 停止"""
+        """对话式生成测试：包装成 ChatML 并在 <|im_end|> 处停止。
+        采样超参与 run_model_for_state.py 对齐（temperature/top_k/top_p/
+        repetition_penalty/frequency_penalty），保证训练 val 与推理一致。"""
         self.model.eval()
-        prompt = f"<|im_start|>user\n{start}<|im_end|>\n<|im_start|>assistant\n"
+        # 字面 \n 对齐 SFT 数据格式（tokenizer 把真实换行归为 <|unk|>）
+        prompt = f"<|im_start|>user\\n{start}<|im_end|>\\n<|im_start|>assistant\\n"
+        im_end_id = self.tokenizer.token_to_id("<|im_end|>")
         ans = self.generator.generate(
             start_token=prompt,
             gen_seq_len=gen_len,
             temperature=temperature,
             frequency_penalty=frequency_penalty,
             top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
             print_out=False,
+            eos_id=im_end_id,  # 生成到 <|im_end|> 自动停止
         )
-        text = "".join(ans)
-        # 从 prompt 之后开始找回答结束标记（ans[0] 即完整 prompt，
-        # 否则会命中 prompt 里 user 回合的结束标记导致返回空串）
+        text = ans  # generate 现在返回 str（旧版 "".join(list) 已不需要）
+        # 兜底：若 eos_id 未命中（模型未学会停止），手动截断
         cut = text.find("<|im_end|>", len(prompt))
         if cut != -1:
             text = text[:cut]
