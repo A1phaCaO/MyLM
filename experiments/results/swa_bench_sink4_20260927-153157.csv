@@ -1,0 +1,2 @@
+stage,mask,seq,window,batch,impl,compile,ms_fp,ms_step,ktok_s,step_dev_mib,step_peak_mib,blockmask_build_ms,wall_s
+swa,pad,2048,256,4,flex,True,0.3766,2.129,3850,182,136.2,96.32,6.1
