@@ -32,12 +32,26 @@ class MyLMArgs:
     base_init_std: float = 0.02  # 基础初始化标准差
     emb_init_std: float = None   # embedding 标准差；None = base_init_std * 0.5（实验最优 embr=0.5）
     pad_id: int = 0              # 用于构造显式 attention padding mask 的 token id；
-                                 # 本项目 SFT 复用 EOS(id=0) 作 pad，pretrain 也以 0 右填充，故默认 0。
-                                 # 取代「pad 行隐藏态全零」的隐式假设（attn_bias 的 o_proj.bias
-                                 # 会让 pad 行残差流在第 1 层后非零，导致原 seq_mask 失效）。
+    # 本项目 SFT 复用 EOS(id=0) 作 pad，pretrain 也以 0 右填充，故默认 0。
+    # 取代「pad 行隐藏态全零」的隐式假设（attn_bias 的 o_proj.bias
+    # 会让 pad 行残差流在第 1 层后非零，导致原 seq_mask 失效）。
 
 
 class RMSNorm(torch.nn.Module):
+    """【已弃用 2026-09】本仓库早期手写 RMSNorm 实现。
+
+    models.py 内所有模型使用点（Attention/CompressedAttention 的 q/k-norm、
+    MyLMDecoderLayer 的 input/post_attention layernorm、MyLM.norm）已全部
+    切换为 torch 原生 `nn.RMSNorm(eps=1e-6)`。本类保留原调用方式
+    （`RMSNorm(hidden_size)`）仅供 bench_module.py 等新旧实现性能/数值对照，
+    模型代码勿再实例化。
+
+    与 `nn.RMSNorm(hidden_size, eps=1e-6)` 数值等价：方差同样在 fp32 中计算
+    （LLaMA 约定），归一化结果转回输入 dtype 后再乘 weight；两者的
+    state_dict 均只有 `weight`(初始为 1) 一个键，形状一致，旧 checkpoint
+    可直接继续加载（eps 不入库，使用点均显式传 1e-6 与旧实现一致）。
+    """
+
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -212,6 +226,11 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(
             args.d_model, args.d_model, bias=args.attn_bias)
 
+        # QK-Norm 逐头沿 head_dim 归一化（不是 d_model），且必须在
+        # view 出多头之后的 (batch, heads, seq, d_head) 张量上使用
+        self.q_norm = nn.RMSNorm(args.d_head, eps=1e-6)
+        self.k_norm = nn.RMSNorm(args.d_head, eps=1e-6)
+
         # 门控层（仅在使用门控时创建）
         if use_gate:
             self.gate = nn.Linear(args.d_model, args.d_model, bias=False)
@@ -307,6 +326,11 @@ class Attention(nn.Module):
             1, 2
         )  # (batch, heads, seq, head_dim)
 
+        # QK-Norm：先归一化再施加 RoPE（主流实现口径）。RoPE 保范数，
+        # 但归一化放在旋转后会让可学习权重与位置旋转交叉作用，改变语义。
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
         # 应用RoPE位置编码
         cos = self.cos_cached[:, :, :seq_len, :]  # (1, 1, seq_len, d_head)
         sin = self.sin_cached[:, :, :seq_len, :]  # (1, 1, seq_len, d_head)
@@ -356,13 +380,271 @@ class Attention(nn.Module):
             )  # 重新组合多头
             y = y * gate  # 应用门控
         else:
-            # 标准注意力：对V应用sigmoid激活
-            y = att @ F.sigmoid(v)  # (batch, heads, seq, head_dim)
+            # 标准注意力：V 不做激活（旧版为 att @ F.sigmoid(v)，随 QK-Norm
+            # 引入一并移除），直接对 v 加权求和
+            y = att @ v  # (batch, heads, seq, head_dim)
             y = (
                 y.transpose(1, 2).contiguous().view(
                     batch_size, seq_len, self.d_model)
             )  # 重新组合多头
+        # 输出投影
+        y = self.resid_dropout(self.o_proj(y))
+        return y
 
+
+class CompressedAttention(nn.Module):
+    """仿DeepSeek CSA的压缩部分实现的注意力机制，并通过门控卷积分支增强局部感受野。"""
+
+    def __init__(self, args: MyLMArgs, compress_ratio=2, base_init_std=0.02):
+        super().__init__()
+        self.d_model = args.d_model
+        self.n_heads = args.n_heads or (args.d_model // args.d_head)
+        self.d_head = args.d_head
+        self.seq_max_len = args.seq_max_len
+        self.compress_ratio = compress_ratio
+        self.args = args
+        # QK-Norm 逐头沿 head_dim 归一化（不是 d_model），且必须在
+        # view 出多头之后的 (batch, heads, seq, d_head) 张量上使用
+        self.q_norm = nn.RMSNorm(args.d_head, eps=1e-6)
+        self.k_norm = nn.RMSNorm(args.d_head, eps=1e-6)
+
+        # 注意力投影层
+        self.q_proj = nn.Linear(
+            args.d_model, args.d_model, bias=args.attn_bias)
+        self.k_proj = nn.Linear(
+            args.d_model, args.d_model, bias=args.attn_bias)
+        self.v_proj = nn.Linear(
+            args.d_model, args.d_model, bias=args.attn_bias)
+        self.o_proj = nn.Linear(
+            args.d_model, args.d_model, bias=args.attn_bias)
+        self.compress_gate = nn.Linear(args.d_head, 1, bias=False)
+        self.gate_proj = nn.Linear(args.d_model, args.d_model, bias=False)
+        self.conv_mix_alpha = nn.Parameter(torch.zeros(1))
+        self.conv = CausalConv1d(
+            in_channels=args.d_model,
+            out_channels=args.d_model,
+            kernel_size=args.d_conv,
+            groups=args.d_model,
+            bias=True,
+        )
+
+        # RoPE位置编码缓存
+        self.register_buffer(
+            "cos_cached", torch.zeros(1, 1, args.seq_max_len, args.d_head)
+        )
+        self.register_buffer(
+            "sin_cached", torch.zeros(1, 1, args.seq_max_len, args.d_head)
+        )
+
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+
+        # 初始化RoPE
+        self._init_rope()
+        self._reset_parameters(base_init_std=base_init_std)
+
+    def _reset_parameters(self, base_init_std=0.02, residual_scale=None):
+        if residual_scale is None:
+            residual_scale = 1.0 / math.sqrt(2 * self.args.n_layers)
+        for proj in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
+            torch.nn.init.normal_(proj.weight, std=base_init_std)
+            if proj.bias is not None:
+                torch.nn.init.zeros_(proj.bias)
+        torch.nn.init.normal_(self.compress_gate.weight, std=base_init_std)
+        self.o_proj.weight.data.mul_(residual_scale)
+
+    def _init_rope(self):
+        """初始化RoPE位置编码"""
+        d_head_half = self.d_head // 2
+        # 创建频率数组，长度为d_head_half
+        inv_freq = 1.0 / (
+            10000 ** (torch.arange(0, d_head_half,
+                                   dtype=torch.float) / d_head_half)
+        )
+
+        t = torch.arange(self.seq_max_len, dtype=torch.float)
+        # 计算位置频率
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+
+        # 扩展到完整维度并添加批次和头数维度
+        emb = torch.cat((freqs, freqs), dim=-1)  # (seq_len, d_head)
+        # 使用register_buffer更新缓存，而不是直接赋值
+        self.register_buffer(
+            "cos_cached", emb.cos().unsqueeze(0).unsqueeze(0)
+        )  # (1, 1, seq_len, d_head)
+        self.register_buffer(
+            "sin_cached", emb.sin().unsqueeze(0).unsqueeze(0)
+        )  # (1, 1, seq_len, d_head)
+
+    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        """旋转一半维度"""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2:]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def _rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+        """对单个张量应用RoPE（q与压缩后k的序列长度不同，需分别调用）"""
+        cos = cos[:, :, : x.size(2), :]  # (1, 1, len, d_head)
+        sin = sin[:, :, : x.size(2), :]
+        return (x * cos) + (self._rotate_half(x) * sin)
+
+    def _compress_kv(self, k: torch.Tensor, v: torch.Tensor):
+        """压缩K和V：每 ratio 个相邻token经gate加权融合为1个meta-KV"""
+        batch_size, n_heads, seq_len, d_head = k.size()
+        ratio = self.compress_ratio
+
+        n_pad = -seq_len % ratio
+        if n_pad != 0:
+            # 在 seq 维（dim=2）补齐到 ratio 的整数倍
+            k = F.pad(k, (0, 0, 0, n_pad))
+            v = F.pad(v, (0, 0, 0, n_pad))
+        len_pad = seq_len + n_pad
+        len_compressed = len_pad // ratio
+
+        # k/v 是 transpose(1,2) 后的非连续视图，view 会抛 stride 错误；
+        # 且这里是把 seq 维拆成 (窗口数, 窗口内token)，窗口维必须紧跟 n_heads
+        k_windows = k.reshape(
+            batch_size, n_heads, len_compressed, ratio, d_head)
+        v_windows = v.reshape(
+            batch_size, n_heads, len_compressed, ratio, d_head)
+
+        scores = self.compress_gate(k_windows).squeeze(-1)  # (b, h, lc, ratio)
+        if n_pad != 0:
+            valid = torch.arange(ratio, device=k.device) < (ratio - n_pad)
+            win_mask = torch.ones(len_compressed, ratio,
+                                  dtype=torch.bool, device=k.device)
+            win_mask[-1] = valid                     # 只有最后一个窗口需要 mask
+            scores = scores.masked_fill(
+                ~win_mask[None, None], float("-inf")
+            )
+        scores = F.softmax(scores, dim=-1)
+        k_compressed = (k_windows * scores.unsqueeze(-1)).sum(-2)
+        v_compressed = (v_windows * scores.unsqueeze(-1)).sum(-2)
+
+        # (b, h, len_compressed, d_head)
+        return k_compressed, v_compressed, len_compressed
+
+    def forward(self, x: torch.Tensor, token_ids=None, mask=None, causal=True) -> torch.Tensor:
+        batch_size, seq_len, _ = x.size()
+
+        # 外部token级mask校验与token有效性提取（mask: (b,1,s,s) bool，True=有效）
+        if mask is not None:
+            # 简单检查mask维度，不符合要求直接抛出异常
+            if mask.dim() != 4:
+                raise ValueError(
+                    f"Mask must be 4-dimensional, got {mask.dim()} dimensions")
+            if mask.shape != (batch_size, 1, seq_len, seq_len):
+                raise ValueError(
+                    f"Mask shape must be {(batch_size, 1, seq_len, seq_len)}, got {mask.shape}")
+            key_valid = mask.amax(dim=2).unsqueeze(-1)      # (b, 1, seq, 1)
+            query_valid = mask.amax(dim=-1) \
+                .squeeze(1).unsqueeze(-1)                   # (b, seq, 1)
+        else:
+            key_valid = None
+            query_valid = None
+
+        # 卷积分支计算：因果卷积感受野覆盖 t-k+1..t，左padding时 pad 行内容
+        # 会经 conv 泄漏进后续有效位（padding 隔离守卫实测泄漏 1.43）。先把
+        # pad 行的卷积输入清零，pad 内容对有效位输出只剩常数(bias)贡献，不泄漏。
+        x_conv_in = x if query_valid is None else x * query_valid.to(x.dtype)
+        conv_res = self.conv(x_conv_in.transpose(1, 2)).transpose(1, 2)
+
+        # 计算QKV
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # 计算门控（仅在使用门控时）
+
+        # 重塑为多头形式
+        q = q.view(batch_size, seq_len, self.n_heads, self.d_head).transpose(
+            1, 2
+        )  # (batch, heads, seq, head_dim)
+        k = k.view(batch_size, seq_len, self.n_heads, self.d_head).transpose(
+            1, 2
+        )  # (batch, heads, seq, head_dim)
+        v = v.view(batch_size, seq_len, self.n_heads, self.d_head).transpose(
+            1, 2
+        )  # (batch, heads, seq, head_dim)
+
+        # QK-Norm：逐头归一化提前到 pad 清零/窗口压缩/RoPE 之前。
+        # nn.RMSNorm 对零向量仍输出零，pad 位清零语义不变；压缩窗口内
+        # 融合的是同尺度（单位 RMS）的 k 向量。
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # 先把对所有query都无效的 key位k/v清零，避免pad隐藏态混入窗口压缩
+        # 结果（nn.RMSNorm 对零向量仍输出零，pad 位清零语义不变）
+        if key_valid is not None:
+            k = k * key_valid.to(k.dtype)
+            v = v * key_valid.to(v.dtype)
+
+        k, v, len_compressed = self._compress_kv(k, v)
+
+        # 应用RoPE位置编码：q用原位置；k每窗口一个，用窗口起始位置
+        # (0, ratio, 2*ratio, ...) 作为landmark位置
+        cos = self.cos_cached[:, :, :seq_len, :]  # (1, 1, seq_len, d_head)
+        sin = self.sin_cached[:, :, :seq_len, :]  # (1, 1, seq_len, d_head)
+        q = self._rope(q, cos, sin)
+        k = self._rope(k, cos[:, :, ::self.compress_ratio],
+                       sin[:, :, ::self.compress_ratio])
+
+        # 计算注意力分数：key维已压缩为 len_compressed
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.d_head))
+        if causal:
+            # 窗口必须整体不在未来才可见: 以"窗口最后一个 token 下标 <= query 位置"
+            # 判定。旧实现按窗口起始 (w*ratio <= t) 判定, 偶数位 query 会看到同窗口
+            # 内的 t+1, 而 t 位置的预测目标恰是 token t+1 —— 目标经压缩 meta-KV
+            # 直接泄漏进注意力, loss 可假降到抄答案水平（探针实测已确认）。
+            # 代价: 偶数位 query 的自身窗口 (含奇数位 t+1) 整窗被屏蔽, 看不到自己,
+            # 自身信息退化为仅走残差流; 若这成为质量瓶颈, 应补 NSA/CSA 式局部
+            # 细分支（小滑窗全分辨率）而非放宽掩码。
+            key_pos = torch.arange(
+                len_compressed, device=x.device) * self.compress_ratio
+            key_end = (key_pos + self.compress_ratio - 1).clamp(
+                max=seq_len - 1)   # 尾窗被 pad 截短, 实际末 token 到 seq_len-1 为止
+            causal_mask = (key_end[None, :] <= torch.arange(
+                seq_len, device=x.device)[:, None]
+            ).view(1, 1, seq_len, len_compressed)
+        else:
+            causal_mask = torch.ones(
+                seq_len, len_compressed, device=x.device, dtype=torch.bool
+            ).view(1, 1, seq_len, len_compressed)
+
+        # 如果提供了外部mask，则将其与因果掩码合并：窗口可见性取「窗口内至少
+        # 一个 key 有效」。不再按窗口起始位采样——左pad下起始位常是pad，会把
+        # 含有效 token 的混合窗口整窗误屏蔽；而 pad 位 k/v 已清零，放行混合
+        # 窗口不会引入 pad 内容。pad query 行整行无效，输出保持全零。
+        if mask is not None:
+            ratio = self.compress_ratio
+            win_valid = key_valid.squeeze(-1)              # (b, 1, seq)
+            n_pad = -seq_len % ratio
+            if n_pad != 0:
+                win_valid = F.pad(win_valid, (0, n_pad), value=False)
+            win_valid = win_valid.view(
+                batch_size, 1, len_compressed, ratio).amax(-1).unsqueeze(2)
+            q_valid4 = query_valid.unsqueeze(1)            # (b, 1, seq, 1)
+            combined_mask = causal_mask & win_valid & q_valid4
+        else:
+            # 只使用因果掩码
+            combined_mask = causal_mask
+
+        att = att.masked_fill(combined_mask == 0, float("-inf"))
+        att = F.softmax(att, dim=-1)
+        # 全被屏蔽的 query 行（query 本身为 pad）softmax 会产生 NaN，
+        # 把 mask 位置重新填 0，保证该行输出为 0 而非 NaN 继续传播
+        att = att.masked_fill(combined_mask == 0, 0.0)
+        att = self.attn_dropout(att)
+
+        y = att @ v  # (batch, heads, seq, head_dim)
+        y = (
+            y.transpose(1, 2).contiguous().view(
+                batch_size, seq_len, self.d_model)
+        )  # 重新组合多头
+        alpha = F.sigmoid(self.conv_mix_alpha)
+        # alpha = 0.5
+        # y = y + conv_res  # 卷积分支信息融合
+        y = (y*(1-alpha) + conv_res *alpha) * F.sigmoid(self.gate_proj(x))  # 卷积分支信息融合并进行门控
         # 输出投影
         y = self.resid_dropout(self.o_proj(y))
         return y
@@ -487,7 +769,8 @@ class MoEFFN(nn.Module):
             # 训练: 容量由首个训练 batch 定下后固定（不随 step 变化，保持
             # torch.compile 图稳定）。训练 batch 很大，容量充足、几乎不丢 token。
             if self.MCap is None:
-                self.MCap = max(1, math.ceil((T * K / N) * self.kappa / 16) * 16)
+                self.MCap = max(1, math.ceil(
+                    (T * K / N) * self.kappa / 16) * 16)
             M = self.MCap
         else:
             # 推理/验证: 优先复用训练 MCap——validate 的 batch 与训练同形状，
@@ -503,7 +786,8 @@ class MoEFFN(nn.Module):
             M = self.MCap
             if M is None:
                 M = max(
-                    1, math.ceil((self.args.seq_max_len * K / N) * self.kappa / 16) * 16
+                    1, math.ceil((self.args.seq_max_len * K / N)
+                                 * self.kappa / 16) * 16
                 )
 
         # Latent 投影
@@ -569,18 +853,25 @@ class MyLMDecoderLayer(nn.Module):
     def __init__(self, args: MyLMArgs, layer_idx=0, base_init_std=0.02):
         super().__init__()
         self.args = args
-        self.attn = Attention(
-            args,
-            use_gate=(layer_idx % 2 == 0),  # 偶数层使用门控注意力，奇数层使用标准注意力
-            base_init_std=base_init_std
-        )
+        # self.attn = Attention(
+        #     args,
+        #     use_gate=(layer_idx % 2 == 0),  # 偶数层使用门控注意力，奇数层使用标准注意力
+        #     base_init_std=base_init_std
+        # )
+        if layer_idx % 2 == 0:
+            self.attn = Attention(args, use_gate=True,
+                                  base_init_std=base_init_std)
+        else:
+            self.attn = CompressedAttention(
+                args, compress_ratio=8, base_init_std=base_init_std)
+
         self.mlp = (
             MoEFFN(args, base_init_std=base_init_std)
             if args.use_moe
             else FFN(args, base_init_std=base_init_std)
         )
-        self.input_layernorm = RMSNorm(args.d_model)
-        self.post_attention_layernorm = RMSNorm(args.d_model)
+        self.input_layernorm = nn.RMSNorm(args.d_model, eps=1e-6)
+        self.post_attention_layernorm = nn.RMSNorm(args.d_model, eps=1e-6)
 
     def forward(self, x: torch.Tensor, token_ids=None, padding_mask=None) -> torch.Tensor:
         # 注意力部分
@@ -647,7 +938,7 @@ class MyLM(nn.Module):
         )
 
         # 输出层
-        self.norm = RMSNorm(args.d_model)
+        self.norm = nn.RMSNorm(args.d_model, eps=1e-6)
         self.head = nn.Linear(args.d_model, args.vocab_size, bias=False)
         self._reset_parameters(base_init_std=args.base_init_std)
 
@@ -686,8 +977,10 @@ class MyLM(nn.Module):
         # softmax 产生 NaN 并经残差继续传播，故 key/query 双向屏蔽。
         if padding_mask is not None:
             key_mask = padding_mask.unsqueeze(1).unsqueeze(2)    # (B, 1, 1, S)
-            query_mask = padding_mask.unsqueeze(1).unsqueeze(-1)  # (B, 1, S, 1)
-            attn_pad_mask = (key_mask & query_mask).bool()        # (B, 1, S, S)
+            query_mask = padding_mask.unsqueeze(
+                1).unsqueeze(-1)  # (B, 1, S, 1)
+            # (B, 1, S, S)
+            attn_pad_mask = (key_mask & query_mask).bool()
         else:
             attn_pad_mask = None
 
@@ -788,3 +1081,17 @@ if __name__ == "__main__":
     outputs_scaled = model_scaled(input_ids[:, :64])  # 使用较短序列
     print(f"缩放模型输出形状: {outputs_scaled.shape}")
     print("缩放模型测试通过!")
+
+    # 新旧 RMSNorm 数值等价 + ckpt 键兼容守卫：模型现用 nn.RMSNorm，
+    # 旧实现（上方已弃用的 RMSNorm 类）保留用于对照。两者 state_dict 均只有
+    # weight 一个键，同权重同 eps 下输出应在 fp32 容差内一致。
+    torch.manual_seed(0)
+    legacy_norm = RMSNorm(64, eps=1e-6)
+    native_norm = nn.RMSNorm(64, eps=1e-6)
+    native_norm.load_state_dict(legacy_norm.state_dict())
+    probe = torch.randn(4, 17, 64, dtype=torch.float32)
+    diff = (legacy_norm(probe) - native_norm(probe)).abs().max().item()
+    assert diff < 1e-6, f"nn.RMSNorm 与旧实现数值不一致，最大差 {diff}"
+    assert set(native_norm.state_dict().keys()) == set(legacy_norm.state_dict().keys()), \
+        "新旧实现 state_dict 键不一致，旧 ckpt 将无法加载"
+    print("RMSNorm 新旧实现等价性测试通过!")

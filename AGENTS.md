@@ -20,6 +20,7 @@ uv run python train_tokenizer.py      # 训练 BBPE tokenizer → tokenizer/
 - `KMP_DUPLICATE_LIB_OK="True"` 只在 `pre_train.py` 顶部设置；跑其他脚本需自行设置。
 - compile 只认 inductor + `mode="max-autotune"`（实测 ~1.7x）；`backend="eager"` 实测更慢。MoE(FixedCap) 是 compile-safe，**不要**用 `exclude_moe_from_compile` 排除（实测慢 ~14%，接口仅遗留）。
 - `PreTrainer.__init__` 设 `torch.set_float32_matmul_precision("high")`（TF32）。
+- Windows spawn 模式下 DataLoader `num_workers>0` 会在 worker 里**重新执行主模块顶层代码**：任何（含临时探针/冒烟脚本）会创建 Trainer 或启动 loader 的脚本，主体必须包在 `if __name__ == "__main__":` 里，否则 worker 套娃启动新 worker 直至卡死/报错（本会话已踩两次）。
 
 ## 目录布局与运行约定
 
@@ -56,5 +57,7 @@ uv run python train_tokenizer.py      # 训练 BBPE tokenizer → tokenizer/
 
 ## 杂项
 
-- TensorBoard 看 `logs/`：`launch_tensorboard.bat`。
+- TensorBoard 看 `logs/`：`launch_tensorboard.bat`。架构测试实验在 `logs/exp/<name>_<时间戳>/`（`arch_test.py` 产出，可多 run 并排：`tensorboard --logdir logs/exp`）。
+- **新架构验证用 `arch_test.py`**（pre_train.py 精简版：双优化器/WSD/梯度累积/确定性续训同口径，砍掉 MoE 热力图/权重统计/文本生成/ckpt pruning）；换模型只改顶部 `build_model`+`MODEL_ARGS`，契约 `forward(ids, padding_mask=...) -> (B,S,V)`；调试可传 override JSON 路径缩短 run（max_steps/val_interval_step）。
+- `tools/checks/bench_module.py`：任意 nn.Module 的 FP/BP/STEP 吞吐+显存 benchmark（纯常量配置，无 CLI 参数；`uv run python tools/checks/bench_module.py`）。
 - 实验产物在 `experiments/results/`（初始化 sweep、sdpa bench 等）；一次性临时脚本约定命名 `bench_*_tmp.py`（已 gitignore）。
