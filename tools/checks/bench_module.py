@@ -15,6 +15,8 @@
   - BP   吞吐: backward 单独事件计时（前向建图不计入）
   - STEP 吞吐: FP+BP(+optimizer.step) 的完整训练步口径，附 FP/BP/OPT 时间分解
 以及显存: 参数+缓冲常驻、FP 峰值、FP+BP 峰值、STEP 峰值（差值≈激活/梯度）。
+目标含 MoEFFN 时额外显示 MoE 激活参数（专家权重按 top-K/N 路由比折减，
+router/共享投影全额计，口径同 arch_test.py）。
 
 口径说明:
   - USE_AMP=True 与 pre_train.py 一致: 权重 fp32 + bf16 autocast。
@@ -47,12 +49,13 @@ from models import (
     MyLMDecoderLayer,
     MyLM,
     CompressedAttention,
+    
 )
 
 # ============================ 常量配置 ============================
 # ---- 形状 / batch（决定 tokens/iter = BATCH x SEQ_LEN；须在 BENCH_TARGETS 之前）----
 BATCH = 64
-SEQ_LEN = 512
+SEQ_LEN = 384
 D_MODEL = 512
 D_INNER = 1344
 VOCAB_SIZE = 7160        # 仅 model 用（tokenizer 实际保存大小）
@@ -106,8 +109,10 @@ def moe_layer(args):
 BENCH_TARGETS = [
     # 直接传对象: 名字自动取类名, 输入按类型给默认(MyLM 用 ids, 其余用 hidden)
     # MoEFFN(default_args()),
-    Attention(default_args(), use_gate=False),
-    CompressedAttention(default_args(), compress_ratio=4),
+    # Attention(default_args(), use_gate=False),
+    # CompressedAttention(default_args(), compress_ratio=8),
+    MoEFFN(default_args()),  # 现役: 模型内所有 MoE 均用它
+    # FFN(default_args()),
     # RMSNorm(default_args().d_model),                     # 已弃用的旧手写实现（对照用）
     # torch.nn.RMSNorm(default_args().d_model, eps=1e-6),  # 现役：模型内所有 norm 均用它
     # torch.nn.LayerNorm(default_args().d_model),
@@ -221,6 +226,30 @@ def count_flops(module, inputs, device):
         return float("nan")
 
 
+def count_active_params(module):
+    """含 MoEFFN 的模块返回 (激活参数, 总参数)；纯 dense/非 Module 返回 None。
+
+    口径同 arch_test.py: 三个专家权重 w_gate/w_up/w_down 按路由比
+    n_experts_per_tok/n_experts 折算有效参数，router 与共享投影
+    （latent_down/up 等）全额计入。须在 compile 包裹前对裸模块调用。
+    """
+    if not isinstance(module, torch.nn.Module):
+        return None
+    moe_layers = [m for m in module.modules() if isinstance(m, MoEFFN)]
+    if not moe_layers:
+        return None
+    ratio_of = {}
+    for m in moe_layers:
+        for p in (m.w_gate, m.w_up, m.w_down):
+            ratio_of[id(p)] = m.Kk / m.N
+    active, total = 0.0, 0
+    for p in module.parameters():
+        n = p.numel()
+        total += n
+        active += n * ratio_of.get(id(p), 1.0)
+    return active, total
+
+
 # ----------------------------- 单模块 benchmark -----------------------------
 
 def bench_module(spec, device: torch.device) -> dict:
@@ -232,6 +261,7 @@ def bench_module(spec, device: torch.device) -> dict:
     torch.manual_seed(SEED)
     module, params = build_module(spec)
     name = spec.get("name") or type(module).__name__
+    active_params = count_active_params(module)   # 裸模块上统计（compile 前）
     if isinstance(module, torch.nn.Module):
         module.to(device)
         module.train(TRAIN_MODE)
@@ -286,7 +316,8 @@ def bench_module(spec, device: torch.device) -> dict:
         t_compile += time.perf_counter()
     torch.cuda.synchronize()
 
-    results = {"name": name, "n_params": n_params, "param_mem": param_mem}
+    results = {"name": name, "n_params": n_params, "param_mem": param_mem,
+               "active_params": active_params}
 
     # ---- FP: no_grad 前向 ----
     torch.cuda.empty_cache()
@@ -384,7 +415,12 @@ def report_one(r: dict):
     print(f"模块: {r['name']}   B={BATCH} S={SEQ_LEN} tokens/iter={tokens:,}")
     print(f"amp={'bf16' if USE_AMP else 'fp32'}  compile={USE_COMPILE}"
           f"  train_mode={TRAIN_MODE}  optimizer={'AdamW' if INCLUDE_OPTIMIZER else '无'}")
-    print(f"参数量: {r['n_params'] / 1e6:.2f} M   "
+    active_str = ""
+    if r.get("active_params") is not None:
+        act, tot = r["active_params"]
+        active_str = (f"   MoE 激活参数: {act / 1e6:.2f} M "
+                      f"({act / tot * 100:.1f}%)")
+    print(f"参数量: {r['n_params'] / 1e6:.2f} M{active_str}   "
           f"参数+缓冲显存: {r['param_mem'] / 2**20:.1f} MiB"
           + (f"   FP 理论算子: {fl / 1e9:.2f} GFLOP" if fl == fl else ""))
     if "compile_s" in r:
