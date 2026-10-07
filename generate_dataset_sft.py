@@ -31,23 +31,25 @@ TOKENIZER_PATH = r"tokenizer/bbpe_tokenizer_7k_260723_xl.json"
 #   - (0, 1)  : 降采样，随机抽取该百分比的行
 #   - 1       : 不采样，使用全部数据
 #   - > 1     : 重复（repeat），将数据重复 int(sample_rate) 次
+# SFT_PATH_DICT = {
+#     r"train_text\SFT\distill_r1_110k_sft_processed.txt": 0.7,
+#     r"train_text\SFT\Infinity-Instruct-Gen-00000-of-00015-processed.txt": 1,
+#     r"train_text\SFT\Infinity-Instruct-5-7-.txt": 1,
+#     r"train_text\SFT\step_sft_chunk99_zh_sft.txt": 1,
+#     r"train_text\SFT\Infinity-Instruct-Gen-7MCore-00000-of-00015-processed.txt": 1,
+#     r"train_text\ultrafineweb-l3-mutistyle-cn-part0.txt": 0.01,
+#     r"train_text\SFT\step_sft_chunk98_zh_sft.txt": 1,
+#     r"train_text\SFT\step_sft_chunk97_zh_sft.txt": 1,
+# }
 SFT_PATH_DICT = {
-    r"train_text\SFT\distill_r1_110k_sft_processed.txt": 0.7,
-    r"train_text\SFT\Infinity-Instruct-Gen-00000-of-00015-processed.txt": 1,
-    r"train_text\SFT\Infinity-Instruct-5-7-.txt": 1,
-    r"train_text\SFT\step_sft_chunk99_zh_sft.txt": 1,
-    r"train_text\SFT\Infinity-Instruct-Gen-7MCore-00000-of-00015-processed.txt": 1,
-    r"train_text\ultrafineweb-l3-mutistyle-cn-part0.txt": 0.01,
-    r"train_text\SFT\step_sft_chunk98_zh_sft.txt": 1,
-    r"train_text\SFT\step_sft_chunk97_zh_sft.txt": 1,
+    r"train_text\SFT\synthetic_sft.txt": 1,
 }
-
-OUTPUT_PATH = r"data/data_sft512v3.txt"  # 输出文件（每行一个完整对话）
+OUTPUT_PATH = r"data/data_sft_synthetic768.txt"  # 输出文件（每行一个完整对话）
 BATCH_SIZE = 2048  # 批量编码大小
 SEED = 42          # shuffle 随机种子
 SHUFFLE = True     # 全局打乱
 DEDUP = True       # 按对话内容去重（SFT 数据重复率高）
-MAX_TOKENS = 512   # 超长阈值（对齐训练 seq_max_len）
+MAX_TOKENS = 768   # 超长阈值（对齐训练 seq_max_len）
 MIN_TOKENS = 8     # 过短阈值，低于则丢弃
 # 超长对话处理方式：
 #   "truncate" : 截断超长对话（多轮对话优先在 assistant 回合后截断，见 TRUNCATE_AT_TURN）

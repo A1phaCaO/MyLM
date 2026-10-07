@@ -33,6 +33,8 @@ def load_model_and_tokenizer():
         n_experts=config["n_experts"],
         n_heads=config["n_heads"],
         d_head=config["d_head"],
+        d_conv=config.get("d_conv", 4),
+        compress_ratio=config.get("compress_ratio", 8),
         vocab_size=tokenizer.get_vocab_size(),
         seq_max_len=config["seq_max_len"],
         conv_bias=False,

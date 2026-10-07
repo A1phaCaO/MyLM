@@ -62,24 +62,24 @@ from utils import WarmUpStableDecayLR, MoEStatsCollector, TextGenerator
 # 契约: build_model(args: MyLMArgs) -> nn.Module
 #       model.forward(x_ids:(B,S) long, padding_mask:(B,S) bool|None) -> (B,S,V) logits
 # args 里 vocab_size / seq_max_len 已由管线注入，其余来自 MODEL_ARGS。
-MODEL_NAME = r"mylm_dense_half_ca8_conv4_gate_mix_fixed(wo compile)"
+MODEL_NAME = r"mylm_moe_half_baseline(wo compile)"
 
 MODEL_ARGS = MyLMArgs(
     d_model=384,
-    latent_moe=False,
-    d_latent=256,
-    d_inner=int(((384 * (8 / 3)) // 64) * 64),
+    latent_moe=True,
+    d_latent=192,
+    d_inner=int(((192 * (8 / 3)) // 64) * 64),
     d_head=128,
     n_heads=None,
     n_layers=6,
     vocab_size=None,          # 由 tokenizer 自动注入，勿硬编码
     seq_max_len=256,
-    use_moe=False,
+    use_moe=True,
     n_experts=8,
     n_experts_per_tok=2,
     moe_capacity=1.25,
     d_conv=4,
-    conv_bias=None,
+    compress_ratio=8,
     ffn_bias=False,
     attn_bias=True,
     dropout=0.05,

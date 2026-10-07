@@ -34,10 +34,10 @@ class TrainingConfig:
     #   "<|im_start|>user\n问题内容<|im_end|>\n<|im_start|>assistant\n回答内容<|im_end|>\n"
     data_dir: str = r"data/data_sft512v3.txt"
     tokenizer_dir: str = r"tokenizer/bbpe_tokenizer_7k_260723_xl.json"
-    model_save_dir: str = r"model\model_m_sftv2.pth"
+    model_save_dir: str = r"model\model_sft_ca8conv4.pth"
     ckpt_save_dir: str = r"ckpt\sft_ckpt.pth"
-    config_save_dir: str = r"model\config_m_sftv2.json"
-    log_dir: str = r"logs/sft/" +"sft_m_v2"+ time.strftime("%y%m%d-%H%M")
+    config_save_dir: str = r"model\config_sft_ca8conv4.json"
+    log_dir: str = r"logs/sft/" +"sft_ca8conv4_"+ time.strftime("%y%m%d-%H%M")
     padding_side: str = "right"   # 右 pad：左截断保留回答尾部 + pad 加在尾部，
     #                                 causal mask 天然隔离 pad，不再依赖 seq_mask 零假设
 
@@ -49,7 +49,8 @@ class TrainingConfig:
     dataset_downsample: float = 1.0   # (0,1)=降采样, 1=全量, >1=重复（SFTTextDataset 语义）
     valset_rate: float = 0.01
     val_interval_step: int = 500
-    seq_max_len: int = 512   # 与 xl pretrain 模型一致
+    seq_max_len: int = 512   # 结构对齐终版 pretrain（256），SFT 扩到 512
+    #                            （加载时过滤 RoPE buffer 形状失配）
     use_compile: bool = True
     compile_mode: str = "max-autotune"
     # compile 时是否将 MoE 层排除在外（已过时，保持默认 False）
@@ -63,20 +64,22 @@ class TrainingConfig:
     use_amp: bool = True
 
     model_args = MyLMArgs(
-        d_model=512,
+        # 架构与 pre_train.py 终版 model_args 完全一致（dense + ca8/conv4），
+        # 仅 seq_max_len 与 dropout 按 SFT 口径调整
+        d_model=384,
         latent_moe=False,
         d_latent=256,
-        d_inner=int(((512 * (8 / 3)) // 64) * 64),
+        d_inner=int(((384 * (8 / 3)) // 64) * 64),  # =1024
         d_head=128,
         n_heads=None,
         n_layers=6,
         vocab_size=None,
         seq_max_len=seq_max_len,
         use_moe=False,
-        n_experts=12,
+        n_experts=8,
         n_experts_per_tok=2,
-        d_conv=None,
-        conv_bias=None,
+        d_conv=4,            # 对齐终版 pretrain（conv4）
+        compress_ratio=8,    # 对齐终版 pretrain（ca8）
         ffn_bias=False,
         attn_bias=True,
         dropout=0.0,          # SFT 微调关闭 dropout
@@ -94,7 +97,7 @@ class TrainingConfig:
     dataset_shuffle_seed: Optional[int] = 42
 
     # SFT 特有：从 pretrain 权重开始微调（纯权重文件或完整 checkpoint 均可）
-    train_from: Optional[str] = r"model\model_dense_m_0813v2.pth"
+    train_from: Optional[str] = r"model\model_dense_ca8conv4_261004.pth"
 
 
 class SFTTrainer(PreTrainer):

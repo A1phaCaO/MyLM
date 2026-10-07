@@ -23,8 +23,10 @@ class MyLMArgs:
     moe_capacity: float = 1.25   # κ: 丢率/吞吐权衡, 实验最优
     moe_ds_gamma: float = 0.003  # DeepSeek loss-free 均衡步长 (无 aux loss);
     # γ=1e-3 太小 (小模型 120 步仍在崩塌), γ=5e-3 实验 400 步均衡到 max 11~13%
-    d_conv: int = 3
-    conv_bias: bool = True
+    d_conv: int = 3              # CompressedAttention conv 局部分支 kernel 大小（终版配置用 4）
+    conv_bias: bool = True       # 【保留】现 conv 分支固定 bias=True（zero-init），不受此字段影响
+    compress_ratio: int = 8      # CompressedAttention 窗口压缩比（终版配置 ca8）；
+                                 # ratio 改变网络结构，必须入 config json
     ffn_bias: bool = False
     attn_bias: bool = False
     d_head: int = 64
@@ -395,13 +397,16 @@ class Attention(nn.Module):
 class CompressedAttention(nn.Module):
     """仿DeepSeek CSA的压缩部分实现的注意力机制，并通过门控卷积分支增强局部感受野。"""
 
-    def __init__(self, args: MyLMArgs, compress_ratio=2, base_init_std=0.02):
+    def __init__(self, args: MyLMArgs, compress_ratio=None, base_init_std=0.02):
         super().__init__()
         self.d_model = args.d_model
         self.n_heads = args.n_heads or (args.d_model // args.d_head)
         self.d_head = args.d_head
         self.seq_max_len = args.seq_max_len
-        self.compress_ratio = compress_ratio
+        # 压缩比从 MyLMArgs 读取（配置单一事实源）；显式传参仅供
+        # bench/消融脚本（如 ca2/ca4 对照）
+        self.compress_ratio = (args.compress_ratio if compress_ratio is None
+                               else compress_ratio)
         self.args = args
         # QK-Norm 逐头沿 head_dim 归一化（不是 d_model），且必须在
         # view 出多头之后的 (batch, heads, seq, d_head) 张量上使用
@@ -451,7 +456,14 @@ class CompressedAttention(nn.Module):
             if proj.bias is not None:
                 torch.nn.init.zeros_(proj.bias)
         torch.nn.init.normal_(self.compress_gate.weight, std=base_init_std)
+        torch.nn.init.normal_(self.gate_proj.weight, std=base_init_std)
         self.o_proj.weight.data.mul_(residual_scale)
+        # conv 权重保留 Conv1d 默认 kaiming（depthwise 下 std≈1/√k，分支
+        # 初始即有效）；bias 归零：Conv1d 默认 bias init 为 U(±1/√k)，量级
+        # ~0.5 远超初始残差流尺度（~0.02），且 alpha 起步 0.5，不归零会让
+        # 卷积分支早期被随机常数主导（对齐仓库 bias 一律 zero-init 约定）
+        if self.conv.conv.bias is not None:
+            torch.nn.init.zeros_(self.conv.conv.bias)
 
     def _init_rope(self):
         """初始化RoPE位置编码"""
@@ -554,8 +566,6 @@ class CompressedAttention(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        # 计算门控（仅在使用门控时）
-
         # 重塑为多头形式
         q = q.view(batch_size, seq_len, self.n_heads, self.d_head).transpose(
             1, 2
@@ -642,9 +652,8 @@ class CompressedAttention(nn.Module):
                 batch_size, seq_len, self.d_model)
         )  # 重新组合多头
         alpha = F.sigmoid(self.conv_mix_alpha)
-        # alpha = 0.5
-        # y = y + conv_res  # 卷积分支信息融合
-        y = (y*(1-alpha) + conv_res *alpha) * F.sigmoid(self.gate_proj(x))  # 卷积分支信息融合并进行门控
+        # 卷积分支与注意力输出按 alpha 混合后做 sigmoid 门控
+        y = (y*(1-alpha) + conv_res*alpha) * F.sigmoid(self.gate_proj(x))
         # 输出投影
         y = self.resid_dropout(self.o_proj(y))
         return y
@@ -853,17 +862,12 @@ class MyLMDecoderLayer(nn.Module):
     def __init__(self, args: MyLMArgs, layer_idx=0, base_init_std=0.02):
         super().__init__()
         self.args = args
-        # self.attn = Attention(
-        #     args,
-        #     use_gate=(layer_idx % 2 == 0),  # 偶数层使用门控注意力，奇数层使用标准注意力
-        #     base_init_std=base_init_std
-        # )
         if layer_idx % 2 == 0:
             self.attn = Attention(args, use_gate=True,
                                   base_init_std=base_init_std)
         else:
-            self.attn = CompressedAttention(
-                args, compress_ratio=8, base_init_std=base_init_std)
+            # compress_ratio 由 MyLMArgs 注入（终版配置 ca8=8）
+            self.attn = CompressedAttention(args, base_init_std=base_init_std)
 
         self.mlp = (
             MoEFFN(args, base_init_std=base_init_std)
@@ -1095,3 +1099,28 @@ if __name__ == "__main__":
     assert set(native_norm.state_dict().keys()) == set(legacy_norm.state_dict().keys()), \
         "新旧实现 state_dict 键不一致，旧 ckpt 将无法加载"
     print("RMSNorm 新旧实现等价性测试通过!")
+
+    # 架构配置接线守卫：奇数层必须全为 CompressedAttention，且
+    # compress_ratio 从 MyLMArgs 注入（不是构造器默认值）；conv bias 已归零
+    ca_layers = [blk.attn for blk in model_scaled.blocks
+                 if isinstance(blk.attn, CompressedAttention)]
+    assert len(ca_layers) == args_scaled.n_layers // 2, "奇数层应全为 CompressedAttention"
+    assert all(l.compress_ratio == args_scaled.compress_ratio for l in ca_layers), \
+        "compress_ratio 未从 MyLMArgs 读取"
+    assert all(torch.count_nonzero(l.conv.conv.bias) == 0 for l in ca_layers), \
+        "conv bias 未 zero-init"
+    print("架构配置接线守卫通过!")
+
+    # 训练反向 NaN 回归守卫：窗口因果判定使 query t<ratio-1 无任何可见窗口
+    # （全 -inf 行），前向靠 softmax 后填 0；反向经 masked_fill/softmax
+    # backward 在 torch 2.13 eager+CUDA 实测安全，此处守住未来 torch 升级
+    # 或算子改动引入 NaN 梯度污染共享 q/k 投影的不变量
+    model_scaled.train()
+    ids_probe = torch.randint(1, args_scaled.vocab_size, (4, 33))
+    ids_probe[:, -7:] = 0  # 右 pad + 33%8=1 覆盖尾窗与全屏蔽行
+    logits_probe = model_scaled(ids_probe, padding_mask=(ids_probe != 0))
+    logits_probe.pow(2).mean().backward()
+    nan_params = [n for n, p in model_scaled.named_parameters()
+                  if p.grad is not None and torch.isnan(p.grad).any()]
+    assert not nan_params, f"反向产生 NaN 梯度: {nan_params}"
+    print("训练方向 NaN 回归测试通过!")

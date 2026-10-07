@@ -70,24 +70,24 @@ class TrainingConfig:
     """训练配置参数"""
 
     # 数据配置
-    data_dir: str = r"data/medium_data256v3.npy"
+    data_dir: str = r"data/large_data384v1.npy"
     tokenizer_dir: str = r"tokenizer/bbpe_tokenizer_7k_260723_xl.json"
-    model_save_dir: str = r"model\model_dense_m_0813v2.pth"
+    model_save_dir: str = r"model\model_dense_ca8conv4_261005.pth"
     ckpt_save_dir: str = r"ckpt\ckpt.pth"
-    config_save_dir: str = r"model\config_dense_m_0813v2.json"
-    log_dir: str = r"logs/" +"dense_m_v2_"+ time.strftime("%y%m%d-%H%M")
+    config_save_dir: str = r"model\config_dense_ca8conv4_261005.json"
+    log_dir: str = r"logs/" +"dense_ca8conv4_261005_"+ time.strftime("%y%m%d-%H%M")
     # log_dir: str = r"logs\xl2_20260809-190755"
     padding_side = "right"
 
     # 训练参数
     seed: int = 42
     epochs: int = 1
-    batch_size: int = 64
-    batch_acceleration: int = 2
+    batch_size: int = 32
+    batch_acceleration: int = 4
     dataset_downsample: int = 1
     valset_rate: float = 0.0016
     val_interval_step: int = 2000
-    seq_max_len = 256   # 对齐 v3 存储长度 257 (=256+1)，loader 零 pad
+    seq_max_len = 384   # 对齐 v3 存储长度 257 (=256+1)，loader 零 pad
     use_compile: bool = True
     # "max-autotune" or "default" or "reduce-overhead"
     compile_mode: str = "max-autotune"
@@ -104,20 +104,22 @@ class TrainingConfig:
     use_amp: bool = True
 
     model_args = MyLMArgs(
+        # 终版架构：取自 arch_test 实验 mylm_dense_half_ca8_conv4_gate_mix_fixed
+        # (logs/exp/..._260927-171958)，dense 小模型 + 奇数层窗口压缩注意力
         d_model=512,
         latent_moe=False,
         d_latent=256,
-        d_inner=int(((512 * (8 / 3)) // 64) * 64),
+        d_inner=int(((512 * (8 / 3)) // 64) * 64),  # =1024
         d_head=128,
         n_heads=None,
-        n_layers=6,
+        n_layers=8,
         vocab_size=None,
         seq_max_len=seq_max_len,
         use_moe=False,
         n_experts=8,
         n_experts_per_tok=2,
-        d_conv=None,
-        conv_bias=None,
+        d_conv=4,            # conv 局部分支 kernel（实验 conv4）；勿传 None——新架构 Conv1d 会崩
+        compress_ratio=8,    # 窗口压缩比（实验 ca8），随 config json 入库
         ffn_bias=False,
         attn_bias=True,
         dropout=0.05,
@@ -132,7 +134,7 @@ class TrainingConfig:
     ckpt_keep_stride: int = 3
     # 新增参数：断点续训的checkpoint路径
     # resume_from: Optional[str] = r"ckpt\ckpt_epoch_0_step_24000.pth"
-    resume_from: Optional[str] = None
+    resume_from: Optional[str] = r"ckpt\ckpt_epoch_0_step_30001.pth"  # 261005 large 数据训练，17:45 进程被外部清理，从 step 30001 续训
     # 数据集固定种子 shuffle（在 PretrainTokenIDDataset 内部实现，替代 DataLoader
     # 原版 RandomSampler：续训时排列完全由 seed 决定，从已消费位置继续无重复。
     # 置 None 则退回原版 DataLoader shuffle 行为）
@@ -917,8 +919,12 @@ class PreTrainer:
                         self.global_step,
                     )
                     # checkpoint 保存（若是 ckpt 触发点）
+                    # 注意：global_step 在上方已 +1，而 need_val 是按自增前的
+                    # global_step 计算的，故这里用 global_step-1 对齐触发口径；
+                    # 否则跨 epoch 时 i 与 global_step 错位，保存条件永远不成立（旧 bug：
+                    # 261005 训练 71% 无任何 step-ckpt 落盘）
                     is_ckpt_step = (
-                        self.global_step % self.config.ckpt_interval_step == 0
+                        (self.global_step - 1) % self.config.ckpt_interval_step == 0
                     )
                     if is_ckpt_step:
                         ckpt_path = f"{self.config.ckpt_save_dir.rsplit('.', 1)[0]}_epoch_{self.current_epoch}_step_{self.global_step}.pth"

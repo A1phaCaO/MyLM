@@ -43,7 +43,8 @@ uv run python train_tokenizer.py      # 训练 BBPE tokenizer → tokenizer/
 
 ## 模型与 tokenizer 关键设计
 
-- `models.py MyLM`：RoPE 预计算 cos/sin buffer、RMSNorm（**variance 用 fp32 计算**再回原 dtype）、SiLU-gated FFN、可选 MoE。奇偶层交替：偶数层 sigmoid 门控注意力，奇数层标准注意力+V sigmoid 激活。
+- `models.py MyLM`：RoPE 预计算 cos/sin buffer、SiLU-gated FFN、可选 MoE。norm 全部用 torch 原生 `nn.RMSNorm(eps=1e-6)`（**variance 用 fp32 计算**再乘回 weight；旧手写 RMSNorm 类已弃用，仅留 `bench_module.py` 对照，state_dict 键一致）。奇偶层交替：偶数层 sigmoid 门控 Attention，奇数层 CompressedAttention（仿 DeepSeek CSA 窗口压缩 KV：每 `compress_ratio` 个 token 融合 1 个 meta-KV，k 用窗口起始 landmark 做 RoPE，depthwise conv 局部分支经 `sigmoid(conv_mix_alpha)` 与注意力输出混合后再 sigmoid 门控）。两类注意力均逐头 QK-Norm（先归一化后 RoPE），V 不做激活。CompressedAttention 因果判定按「窗口末 token <= query」（按窗口起始判定会让目标 token 经 meta-KV 泄漏、loss 假降；代价是 query 自身窗口不可见，近端信息靠 conv 分支，全屏蔽行 softmax NaN 靠后向剪枝实测安全）。
+- **终版架构（261004 定）**：dense，`MyLMArgs` = d_model 384 / d_inner 1024 / d_head 128 / n_layers 6 / attn_bias=True / dropout 0.05 / `d_conv=4` / `compress_ratio=8`，取自 arch_test 实验 `mylm_dense_half_ca8_conv4_gate_mix_fixed`（`logs/exp/..._260927-171958`）。`compress_ratio` 是结构字段（不在构造器默认里），必须随 config json 入库；`d_conv=None` 会在新架构 Conv1d 直接崩。
 - DeepNet 残差缩放（o_proj/down_proj/latent_up × `1/sqrt(2*n_layers)`）**烧在 `_reset_parameters` 里**，`MyLMArgs` 没有对应字段。
 - MoE `MoEFFN`：FixedCap 分桶（纯 tensor 操作，compile 友好）、DeepSeek 无辅助 loss 均衡（`expert_bias` buffer）、可选 `latent_moe`；κ=`moe_capacity=1.25`（实测最优）。
 - **显式 padding mask**：`MyLMArgs.pad_id`（默认 0）→ `MyLM.forward` 用 `(ids != pad_id)` 构 4D mask 逐层下传，与 causal mask 相交。旧的 `(x.sum(-1)!=0)` 启发式已废弃（`attn_bias` 下会失效）。`padding_mask=None` = 纯 causal（推理）。
@@ -54,6 +55,7 @@ uv run python train_tokenizer.py      # 训练 BBPE tokenizer → tokenizer/
 
 - ckpt 是裸 `torch.save` dict：`torch.load(..., weights_only=False)`；键可能带 `module.` / `_orig_mod.` 前缀，load 前先剥离。
 - `_build_model` 内已 `torch.compile`，`self.model` 是 `OptimizedModule`，`state_dict()` 键带 `_orig_mod.` 前缀——对已剥前缀的 ckpt 做前缀过滤必须作用在裸模型上（`getattr(self.model, "_orig_mod", self.model)`），否则**所有键被过滤掉、权重静默不加载**（症状：loss ≈ ln(vocab)）。同理处理 seq_max_len 扩展时 RoPE buffer 的形状失配过滤。
+- 260927 架构变更（QK-Norm / CompressedAttention / conv 分支）后参数键集与旧 ckpt 不兼容，strict load 会**缺键大声报错**——预期行为，勿用 `strict=False` 掩盖。
 
 ## 杂项
 

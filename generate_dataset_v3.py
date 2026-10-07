@@ -15,16 +15,16 @@ tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
 #   - 1       : 不采样，使用全部数据
 #   - > 1     : 重复（repeat），将数据重复若干次。例如 3 表示将数据重复 3 倍
 path_sample_dict = {
-    r"train_text\ultrafineweb-l3-mutistyle-cn-part0.txt": 0.63,
+    r"train_text\ultrafineweb-l3-mutistyle-cn-part0.txt": 1.0,
     r"train_text\ultrafineweb-zh-part-001-of-256-downsample8x.txt": 1,
     r"train_text\SkyPile2023-14_zh_middle_0010_processed.txt": 1,
-    r"train_text\WanJuan1.0part-000036-a894b46e-downsample30x-processed.txt": 0.31,
-    r"train_text\ultrafineweb-l3-mutistyle-en-part0.txt": 0.28,
-    r"train_text\SkyPile2022-40_zh_middle_0011_processed.txt": 0.34
+    r"train_text\WanJuan1.0part-000036-a894b46e-downsample30x-processed.txt": 0.75,
+    r"train_text\ultrafineweb-l3-mutistyle-en-part0.txt": 0.47,
+    r"train_text\SkyPile2022-40_zh_middle_0011_processed.txt": 0.78
 }
 
 # 设定句子的最大长度
-SENTENCE_MAXLEN = 256 + 1
+SENTENCE_MAXLEN = 384 + 1
 BATCH_SIZE = 2048  # 设置合适的批量大小
 # 定义分隔符和是否从符号位置开始切分句子的标志
 SPLIT_SYMBOL = (
@@ -37,7 +37,7 @@ SPLIT_SYMBOL = (
     "?",
 )
 SPLIT_FROM_SYMBOL = False
-OUTPUT_PATH = r"data/medium_data256v3.npy"
+OUTPUT_PATH = r"data/large_data384v1.npy"
 # 输出 dtype：默认 uint16（vocab=7160 ≪ 65535），未来词表扩张到 >65535 时改 np.int32
 OUTPUT_DTYPE = np.uint16
 SHUFFLE = True  # 按BATCH_SIZE进行随机打乱
