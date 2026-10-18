@@ -171,6 +171,7 @@ class PretrainTokenIDDataset(torch.utils.data.Dataset):
         pad_value: int = 0,
         dtype=np.uint16,
         shuffle_seed: Optional[int] = None,
+        eos_value: int = 0,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -178,6 +179,9 @@ class PretrainTokenIDDataset(torch.utils.data.Dataset):
         self.padding_side = padding_side
         self.pad_value = pad_value
         self.dtype = dtype
+        # EOS 与 pad 同为 id 0 时，按 token 值生成的 mask 会把所有 EOS 一起清零，
+        # 模型永远学不会"停"，因此需要按位置区分末尾 EOS 与对齐 pad（见 _create_mask_from_ids）
+        self.eos_value = eos_value
         # mmap 流式加载：不会一次性把整个文件读进内存
         self.data = np.load(data_dir, mmap_mode="r")
         self.n_samples = self.data.shape[0]
@@ -243,8 +247,36 @@ class PretrainTokenIDDataset(torch.utils.data.Dataset):
             raise ValueError("padding_side must be 'left' or 'right'")
         return seq
 
+    def _create_mask_from_ids(self, raw_ids) -> list[int]:
+        """按 id 序列生成 mask，长度 = len(raw_ids)；mask[i] = 「预测 raw[i+1] 是否计 loss」。
+
+        EOS 与 pad 同为 id 0 时，纯按值判定会把段落结束符一起清零（模型学不会"停"），
+        因此按位置补回监督：
+        - 找最后一个非 pad 位置 last（pad_seq 用右填充，有效区段从 0 开始）
+        - 若 raw[last] 就是正文末尾、紧跟其后的 raw[last+1] 是 EOS，则 mask[last] = 1
+          （这正是「正文后首个 EOS」，旧实现里它会被当成 pad 清零）
+        - 若末尾 token 本身是 EOS（它没有下一个预测位），无从补，保持原样
+        - 左填充（旧兼容路径）不满足上述前提，退回纯按值判定
+        __getitem__ 直接复用本函数的返回值（不再切片），保证训练与测试口径一致。
+        """
+        n = len(raw_ids)
+        mask = self._create_loss_mask(raw_ids, padding_value=self.pad_value)
+        if not n or self.padding_side != "right":
+            return mask
+        last = n - 1
+        while last >= 0 and int(raw_ids[last]) == int(self.pad_value):
+            last -= 1
+        if last >= 0 and last + 1 < n and int(raw_ids[last + 1]) == int(self.eos_value):
+            mask[last] = 1
+        mask[-1] = 0
+        return mask
+
     def _create_loss_mask(self, padded_seq, padding_value: int = 0) -> list[int]:
-        """生成 loss mask：有效位置为 1，padding 位置为 0"""
+        """生成 loss mask：有效位置为 1，padding 位置为 0。
+
+        只按 token 值判定：EOS 与 pad 同值（都用 id 0）时结束符也会被清零，
+        因此「末尾 EOS 计入监督」的位置修正由 _create_mask_from_ids 完成。
+        """
         return [0 if int(t) == padding_value else 1 for t in padded_seq]
 
     def __len__(self):
@@ -273,8 +305,9 @@ class PretrainTokenIDDataset(torch.utils.data.Dataset):
         inputs = raw_tensor[:-1].contiguous()   # length = seq_max_len
         outputs = raw_tensor[1:].contiguous()    # length = seq_max_len
 
-        # 生成 loss mask（对应 output 位置）
-        mask = self._create_loss_mask(outputs.cpu().tolist(), padding_value=self.pad_value)
+        # 生成 loss mask（对应 output 位置，mask[i] 预测 raw[i+1]）：
+        # 统一由 _create_mask_from_ids 产出，避免两处口径不一致
+        mask = self._create_mask_from_ids(raw_tensor.tolist())
         mask_tensor = torch.tensor(mask, dtype=torch.float32)
 
         return (inputs, outputs, mask_tensor)
@@ -293,13 +326,14 @@ class SFTTextDataset(torch.utils.data.Dataset):
     assistant 回答后拆成多个单轮样本（对 SFT 训练无害，每个片段仍是完整对话）；
     单行完整对话不受影响，整行作为一个样本。
 
-    集成 SFT loss mask 生成（Qwen 策略，对齐旧 SFT 脚本语义）：
-    - assistant 回答正文 = 1（计 loss），不含角色标记与 <|im_end|>
-    - 特殊 token（<|im_start|>/<|im_end|>/<|beginoftext|>）= 1（可关闭）
-    - user/system 内容、角色标记、pad = 0
-    - pad 复用 <|endoftext|>（id=0，对齐 Qwen：EOS=pad 同一 token；
-      tokenizer 里的 <|pad|>(id=2) 是保留字段，不用于训练）；
-      因此行尾 <|endoftext|> 与 pad 位置同样被 mask 强制为 0（不计 loss）
+    集成 SFT loss mask 生成（对齐 Qwen 最新版 ChatML 语义）：
+    - assistant 回答正文 = 1（计 loss）
+    - 回答末尾 <|im_end|> = 1：模型必须学会生成它才会停
+    - <|im_start|> / 角色词 / 分隔符 = 0：格式化前缀不是训练目标
+    - user/system 内容、pad = 0
+    - pad 复用 <|endoftext|>（id=0，对齐 Qwen 的 pad_token；tokenizer 里的
+      <|pad|>(id=2) 是保留字段，不用于训练）；SFT 数据不含 <|endoftext|>，
+      因此该兜底不影响 <|im_end|> 的监督
     - 固定种子 shuffle：续训按已消费位置继续，数据不重复
 
     注意：tokenizer 以路径传入并在内部独立加载，避免训练时
@@ -334,12 +368,13 @@ class SFTTextDataset(torch.utils.data.Dataset):
             self.tokenizer.encode("<|im_start|>").ids, dtype=np.int64)
         self.im_end_ids = np.asarray(
             self.tokenizer.encode("<|im_end|>").ids, dtype=np.int64)
-        eot_id = self.tokenizer.token_to_id("<|endoftext|>")
-        self.eot_ids = np.asarray([eot_id if eot_id is not None else 0],
-                                  dtype=np.int64)
-        bot_id = self.tokenizer.token_to_id("<|beginoftext|>")
-        self.bot_ids = (np.asarray([bot_id], dtype=np.int64)
-                        if bot_id is not None else None)
+        # 锚点（不含结尾字面 "\n"），用于定位 assistant 回合；见 _find_answer_spans
+        self.msg_sep = "\\n"
+        _head = (assistant_prefix[:-len(self.msg_sep)]
+                 if assistant_prefix.endswith(self.msg_sep) else assistant_prefix)
+        self._prefix_has_sep = _head != assistant_prefix
+        self.assistant_head_ids = np.asarray(
+            self.tokenizer.encode(_head).ids, dtype=np.int64)
         self.assistant_prefix_ids = np.asarray(
             self.tokenizer.encode(assistant_prefix).ids, dtype=np.int64)
 
@@ -439,14 +474,19 @@ class SFTTextDataset(torch.utils.data.Dataset):
         if K == 0:
             raise ValueError("数据集为空（0 个样本），请检查数据文件与切分规则")
         hit = 0
+        sup_tokens = 0
         for si in range(K):
             s, e = self.samples[si]
             with open(self.data_dir, "rb") as f:
                 f.seek(s)
                 txt = f.read(e - s).decode("utf-8", errors="ignore")
             ids = np.asarray(self.tokenizer.encode(txt).ids, dtype=np.int64)
-            if self._find_subseq(ids, prefix).size > 0:
+            # 用训练实际使用的定位逻辑自检（而不是完整 prefix 匹配），
+            # 保证「抽检通过」== 「回答正文真的有 loss」
+            spans = self._find_answer_spans(ids)
+            if len(spans) > 0:
                 hit += 1
+                sup_tokens += sum(b - a for a, b in spans)
         if hit == 0:
             raise RuntimeError(
                 f"SFT mask 自检失败：抽检 {K} 个样本中 0 个能匹配到 assistant 前缀 "
@@ -457,6 +497,11 @@ class SFTTextDataset(torch.utils.data.Dataset):
             print(
                 f"[SFT 警告] 抽检 {K} 个样本仅 {hit} 个命中 assistant 前缀，"
                 f"其余可能无 assistant 回合或格式不规整。"
+            )
+        if hit > 0:
+            print(
+                f"[SFT 自检] 抽检 {K} 个样本，{hit} 个含 assistant 回答正文，"
+                f"平均每样本 {sup_tokens / max(1, hit):.1f} 个 token 计入 loss。"
             )
 
     def set_permute_seed(self, seed: int):
@@ -535,11 +580,71 @@ class SFTTextDataset(torch.utils.data.Dataset):
         windows = np.lib.stride_tricks.sliding_window_view(seq, n)
         return np.flatnonzero((windows == sub).all(axis=1))
 
+    def _skip_msg_sep(self, seq: np.ndarray, p: int) -> int:
+        """从下标 p 起消费字面消息分隔符 "\\n"（反斜杠+n），返回回答首个 token 下标。
+
+        BBPE 合并的三种情况：
+        - ['\\', 'n']      两 token：两个 token 都属于分隔符，返回其后的下标
+        - ["n这"]          单 token 跨边界（含分隔符尾字符 + 回答首字符）：
+                           返回该 token 下标，把它计入回答正文（宁可多算 1 个
+                           字符，也不能因为格式瑕疵让整轮回答丢掉 loss）
+        - 无匹配           数据未按约定带字面分隔符 / 解码异常：返回 p（不跳过），
+                           由调用方按「锚点之后即回答正文」兜底
+        """
+        n = len(seq)
+        sep = self.msg_sep
+        dec = ""
+        while p < n:
+            piece = self.tokenizer.decode([int(seq[p])], skip_special_tokens=False)
+            if not piece:
+                break
+            cand = dec + piece
+            if len(cand) <= len(sep) and sep.startswith(cand):
+                dec = cand
+                p += 1
+                if dec == sep:
+                    return p
+                continue
+            if cand.startswith(sep):
+                return p
+            break
+        return p
+
+    def _find_answer_spans(self, seq: np.ndarray):
+        """返回所有 assistant 回合回答正文的 (start, end) 下标区间（end 不含 <|im_end|>）。
+
+        不能直接用完整 assistant_prefix_ids 做子序列匹配：prefix 以字面 "\\n" 结尾，
+        而 BBPE 会把结尾的 'n' 与回答首字符合并成一个 token（如 "n这"），此时
+        [<|im_start|>, assistant, '\\', 'n'] 这 4 个 token 在序列里根本不存在，
+        整轮回答会静默丢掉 loss（实测约 20% 的回合命中失败，且 loss 照常下降）。
+        因此：用不含分隔符的锚点 <|im_start|>assistant 定位回合，再用
+        _skip_msg_sep 消费分隔符得到正文起点。
+        """
+        spans = []
+        anchor = self.assistant_head_ids
+        n = len(seq)
+        if n == 0 or len(anchor) == 0:
+            return spans
+        for s in self._find_subseq(seq, anchor):
+            p = int(s) + len(anchor)
+            if self._prefix_has_sep:
+                p = self._skip_msg_sep(seq, p)
+            # 找该轮最近的 <|im_end|>（只在该轮剩余部分找，避免跨轮）
+            ends = self._find_subseq(seq[p:], self.im_end_ids)
+            end = n if len(ends) == 0 else int(p + ends[0])
+            if end > p:
+                spans.append((p, end))
+        return spans
+
     def _build_sft_mask(self, raw_ids: np.ndarray) -> np.ndarray:
         """生成 SFT loss mask（float32，长度=len(raw_ids)，对应 output 位置）：
         - assistant 回答正文（角色标记之后、<|im_end|> 之前）= 1
-        - 特殊 token（im_start/im_end/endoftext/beginoftext）= 1（可关闭）
-        - user/system 内容、角色标记、pad = 0
+        - <|im_end|> = 1：模型必须学会生成它才会停
+        - <|im_start|> / 角色词 / 分隔符 = 0：对齐 Qwen 最新版 ChatML，
+          只有 content 是训练目标，格式化前缀不是
+        - user/system 内容、pad = 0
+        回答正文起点的定位见 _find_answer_spans（锚点不含结尾字面 "\\n"，
+        因为 BBPE 会把该 'n' 与回答首字符合并，详见该函数说明）。
         多轮对话：每个 assistant 段分别处理；
         无 <|im_end|> 时以序列末尾兜底（末尾可能是被截断的回答）。
         """
@@ -547,26 +652,17 @@ class SFTTextDataset(torch.utils.data.Dataset):
         mask = np.zeros(n, dtype=np.float32)
         seq = np.asarray(raw_ids, dtype=np.int64)
 
-        # 1) 特殊 token 不 mask（Qwen 策略）
+        # 1) 结束符 <|im_end|> 计入监督
         if self.mark_special_tokens:
-            for sub in (self.im_start_ids, self.im_end_ids, self.eot_ids):
-                for p in self._find_subseq(seq, sub):
-                    mask[p:p + len(sub)] = 1.0
-            if self.bot_ids is not None:
-                for p in self._find_subseq(seq, self.bot_ids):
-                    mask[p:p + len(self.bot_ids)] = 1.0
+            for p in self._find_subseq(seq, self.im_end_ids):
+                mask[p:p + len(self.im_end_ids)] = 1.0
 
         # 2) assistant 回答正文置 1（不覆盖特殊 token 已置 1 的位置，两者区域不重叠）
-        pre_len = len(self.assistant_prefix_ids)
-        for s in self._find_subseq(seq, self.assistant_prefix_ids):
-            content_start = min(s + pre_len, n)
-            # 找该轮最近的 <|im_end|>（只在该轮剩余部分找，避免跨轮）
-            ends = self._find_subseq(seq[content_start:], self.im_end_ids)
-            content_end = n if len(ends) == 0 else int(content_start + ends[0])
-            mask[content_start:content_end] = 1.0
+        for span_start, span_end in self._find_answer_spans(seq):
+            mask[span_start:span_end] = 1.0
 
-        # 3) 兜底：pad 区强制 0。pad 复用 <|endoftext|>（id=0，对齐 Qwen），
-        #    因此数据中行尾的 <|endoftext|> 与 pad 位置统一不计 loss
+        # 3) 兜底：pad 区强制 0。pad 复用 <|endoftext|>（id=0，对齐 Qwen 的
+        #    pad_token），SFT 数据里不出现该 token，因此不影响 <|im_end|> 的监督
         mask[seq == self.pad_value] = 0.0
         return mask
 

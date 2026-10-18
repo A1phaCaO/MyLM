@@ -262,7 +262,10 @@ class ArchTestTrainer:
             pin_memory=True,
             num_workers=2,
             prefetch_factor=2,
-            persistent_workers=False,
+            # val 数据集/顺序全程不变 -> 复用 worker 池；False 时每次触发
+            # validate 都要重新 spawn 进程（Windows 下每个 worker 重新 import
+            # 主模块 + torch，数十秒 GPU 空转，表现为「一到 val 就卡住」）
+            persistent_workers=True,
         )
         return train_loader, val_loader
 
