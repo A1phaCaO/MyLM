@@ -14,6 +14,6 @@ __pycache__/
 *.npy
 *.log
 data_process/*.jsonl
-# 一次性临时基准脚本（不进版本库）
+# 兜底：防止一次性测试脚本误放仓库根（应放 experiments/，见 AGENTS.md）
 bench_*_tmp.py
 
