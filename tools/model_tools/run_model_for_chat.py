@@ -12,9 +12,10 @@ from tokenizers import Tokenizer  # 引入 tokenizers 库
 import tokenizers
 import rich.markdown
 # 导入模型文件
-config_dir = r"model\config_m_sftv2.json"  # SFT 模型用 SFT 配置（seq_max_len=512）
+config_dir = r"model\config_sft_ca8conv4_synthetic_mix_nano.json"  # SFT 训练时的模型本征配置
 tokenizer_dir = r"tokenizer/bbpe_tokenizer_7k_260723_xl.json"
-model_dir = r"model\model_m_sftv2.pth"
+# 权重要与 config 配套：这里默认加载 SFT 产出，否则 SFT 配置 + base 权重只会得到 base 模型的行为
+model_dir = r"model\model_sft_ca8conv4_synthetic_mix_nano.pth"
 
 with open(config_dir, 'r', encoding='utf-8') as f:
     config = json.load(f)
@@ -48,7 +49,7 @@ args = m.MyLMArgs(
     d_conv=config.get('d_conv', 4),              # 终版架构 conv4
     compress_ratio=config.get('compress_ratio', 8),  # 终版架构 ca8
     vocab_size=tokenizer.get_vocab_size(),
-    seq_max_len=512,
+    seq_max_len=768,
     conv_bias=False,
     ffn_bias=False,
     attn_bias=True,
@@ -111,7 +112,7 @@ INSTURCT_MODE = True
 _im_end_id = tokenizer.token_to_id("<|im_end|>")
 
 # ============ 多轮对话开关 ============
-MULTI_TURN = True           # True=多轮对话（保留上下文）；False=单轮（每次独立提问）
+MULTI_TURN = False           # True=多轮对话（保留上下文）；False=单轮（每次独立提问）
 HISTORY_TOKEN_BUDGET = 384  # 多轮时历史上下文 token 预算（< seq_max_len=512，避免截断破坏格式）
 # ===================================
 
