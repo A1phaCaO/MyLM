@@ -1,4 +1,4 @@
-import os
+﻿import os
 import subprocess
 import sys
 import glob
@@ -72,11 +72,11 @@ class TrainingConfig:
     # 数据配置
     data_dir: str = r"data/large_data384v1.npy"
     tokenizer_dir: str = r"tokenizer/bbpe_tokenizer_7k_260723_xl.json"
-    model_save_dir: str = r"model\model_dense_ca8conv4_261005.pth"
+    model_save_dir: str = r"model\model_dense_ca8conv4_261007.pth"
     ckpt_save_dir: str = r"ckpt\ckpt.pth"
-    config_save_dir: str = r"model\config_dense_ca8conv4_261005.json"
-    log_dir: str = r"logs/" +"dense_ca8conv4_261005_"+ time.strftime("%y%m%d-%H%M")
-    # log_dir: str = r"logs\xl2_20260809-190755"
+    config_save_dir: str = r"model\config_dense_ca8conv4_261007.json"
+    # log_dir: str = r"logs/" +"dense_ca8conv4_261007_"+ time.strftime("%y%m%d-%H%M")
+    log_dir: str = r"logs/dense_ca8conv4_261007_261007-1320-part6"
     padding_side = "right"
 
     # 训练参数
@@ -85,7 +85,7 @@ class TrainingConfig:
     batch_size: int = 32
     batch_acceleration: int = 4
     dataset_downsample: int = 1
-    valset_rate: float = 0.0016
+    valset_rate: float = 0.0008
     val_interval_step: int = 2000
     seq_max_len = 384   # 对齐 v3 存储长度 257 (=256+1)，loader 零 pad
     use_compile: bool = True
@@ -100,7 +100,7 @@ class TrainingConfig:
     learning_rate: float = 5e-3
     min_learning_rate: float = 5e-4  # WSD LRS衰减到峰值LR的10%
     lr_decay_start_rate: int = 0.75  # 最后衰减
-    warmup_steps: int = 5
+    warmup_steps: int = 15
     use_amp: bool = True
 
     model_args = MyLMArgs(
@@ -133,8 +133,8 @@ class TrainingConfig:
     ckpt_keep_recent: int = 3
     ckpt_keep_stride: int = 3
     # 新增参数：断点续训的checkpoint路径
-    # resume_from: Optional[str] = r"ckpt\ckpt_epoch_0_step_24000.pth"
-    resume_from: Optional[str] = r"ckpt\ckpt_epoch_0_step_30001.pth"  # 261005 large 数据训练，17:45 进程被外部清理，从 step 30001 续训
+    resume_from: Optional[str] = None
+    resume_from: Optional[str] = r"ckpt\ckpt_epoch_0_step_36001.pth"  # 261005 large 数据训练，17:45 进程被外部清理，从 step 30001 续训
     # 数据集固定种子 shuffle（在 PretrainTokenIDDataset 内部实现，替代 DataLoader
     # 原版 RandomSampler：续训时排列完全由 seed 决定，从已消费位置继续无重复。
     # 置 None 则退回原版 DataLoader shuffle 行为）
@@ -158,7 +158,14 @@ class PreTrainer:
         self.optimizers, self.schedulers = self._build_optimizer()
         self.scaler = torch.GradScaler(self.device, enabled=config.use_amp)
         self.generator = TextGenerator(
-            self.model, self.tokenizer, self.device, padding_side="none"
+            # 传未 compile 的裸模块(_orig_mod 与 OptimizedModule 共享参数/权重):
+            # decode 每步序列 +1、形状逐 token 变化,走 dynamo 会在每次训练进程
+            # 首个 generate 时触发一串重编译(实测 experiments/val_stall_profile:
+            # exp2_none 首轮 73.9s、18 次重编译、GPU 空闲 94%;exp3 显示
+            # max-autotune 下单次编译代价还要 ×2.6,即生产约 3 分钟)。B=1 的
+            # decode 从 compile 拿不到收益,exp2_eager 全程 0.56s、0 重编译。
+            getattr(self.model, "_orig_mod", self.model),
+            self.tokenizer, self.device, padding_side="none"
         )
 
         # 用于扩展的属性
@@ -219,6 +226,8 @@ class PreTrainer:
             downsample=self.config.dataset_downsample,
             padding_side=self.config.padding_side,
             shuffle_seed=self.config.dataset_shuffle_seed,
+            # EOS 与 pad 同为 id 0：首个（末尾）EOS 计入监督，其余按 pad 清零
+            eos_value=0,
             # dtype 默认 uint16，与 generate_dataset_v3 一致；若 v3 改 int32 这里也改
         )
         val_dataset_len = int(len(dataset) * self.config.valset_rate)
@@ -247,12 +256,21 @@ class PreTrainer:
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
             batch_size=self.config.batch_size,
-            shuffle=True,
+            # 固定顺序遍历：shuffle=True + drop_last 会让每次 val 丢弃的尾部
+            # batch 集合漂移，相邻两次的 val_loss 不严格可比；固定后每次 val
+            # 恰好遍历同一组 batch（口径与 arch_test.py 一致）
+            shuffle=False,
             drop_last=True,
             pin_memory=True,
-            num_workers=4,
-            prefetch_factor=3,
-            persistent_workers=False
+            num_workers=2,
+            prefetch_factor=2,
+            # persistent_workers=True：val 数据集与顺序全程不变（不依赖
+            # set_permute_seed 的 epoch 重排，train 那边才必须每 epoch 重 spawn），
+            # worker 池只在首次 validate 时 spawn 一次、之后跨 val/跨 epoch 复用。
+            # 此前 False 导致每次触发验证都重新 spawn 一批进程（Windows spawn 下
+            # 每个 worker 都要重新 import 主模块 + torch/bnb，数十秒），
+            # 表现为「一到 val 就卡住、GPU 长时间空转」。
+            persistent_workers=True
         )
 
         return train_loader, val_loader
@@ -774,6 +792,10 @@ class PreTrainer:
                     0,
                 )
 
+            # 训练速度/吞吐统计（Perf/*，窗口=一个优化器步，验证/checkpoint 耗时不计入）
+            perf_t_last = time.perf_counter()
+            perf_tokens = 0  # 窗口内有效 token 数（与 loss 加权同口径）
+
             acc_num = 0.0   # 累加组中有效 token 的 loss 分子（仅日志用，float；不再保留 autograd 图）
             acc_den = 0      # 累加组中有效 token 数
             for i, (train_inputs, train_targets, train_mask) in enumerate(
@@ -782,12 +804,23 @@ class PreTrainer:
                 # 跳过已训练的step（非 resume 时 start_step=0，不跳过任何 batch；
                 # resume 时从 start_step 位置继续，`i <` 保证不重复消费）
                 if i < self.start_step and epoch == self.start_epoch:
+                    perf_t_last = time.perf_counter()  # 跳过耗时不计入首个统计窗口
                     continue
                 self.current_step = i
-                # 提前计算 need_val：基于 i 和 step 后的 global_step（即 global_step+1）
-                need_val = ((i % self.config.val_interval_step == 0) or (
-                    (self.global_step) % self.config.ckpt_interval_step == 0
-                )) and i > 0
+                # need_val 统一按自增前的 global_step 触发（ckpt 保存口径同为 global_step）。
+                # 不用 i%val_interval 触发：i 与 global_step 是两个时钟，续训/跨 epoch 后
+                # 相对错位，i 口径会在加载后几步内就撞上 2000 倍数，导致刚 eval 过的 ckpt
+                # 又被重复验证一遍；global_step 恢复时精确还原，续训后必然等一个完整周期才触发
+                # 续训首个 batch 额外兜底：ckpt 本就是 validate 之后才落盘的，
+                # 若加载点恰好压在触发整倍数上（如 epoch 级 ckpt），首步不再重复 eval
+                is_resume_first = (
+                    epoch == self.start_epoch and i == self.start_step
+                )
+                need_val = ((
+                    self.global_step % self.config.val_interval_step == 0
+                ) or (
+                    self.global_step % self.config.ckpt_interval_step == 0
+                )) and i > 0 and not is_resume_first
                 # 仅在需要记录时开启MoE统计，避免每步额外开销
                 if self.moe_collector is not None:
                     self.moe_collector.set_enabled(need_val)
@@ -802,6 +835,7 @@ class PreTrainer:
                 den_int = int(den.item())
                 acc_num += float(num.item())   # 仅日志用（有效 token loss 分子累加）
                 acc_den += den_int
+                perf_tokens += den_int
 
                 self.scaler.scale(num).backward()
 
@@ -828,6 +862,24 @@ class PreTrainer:
                         self.schedulers[0].get_last_lr()[0]))
                 )
                 self.global_step += 1
+
+                # 训练速度与吞吐（tag 对齐 arch_test 的 Perf/*；窗口=一个优化器步）。
+                # 先同步 CUDA，避免计到的只是 kernel 入队时间（step 尾部 GPU 工作会
+                # 落到下一个窗口，同步后归属才准确，代价是每个优化器步多一次 sync）。
+                if is_step_boundary:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    perf_dt = time.perf_counter() - perf_t_last
+                    if perf_dt > 0 and perf_tokens > 0:
+                        writer.add_scalar(
+                            "Perf/step_ms", perf_dt * 1000.0, self.global_step)
+                        writer.add_scalar(
+                            "Perf/tok_s",
+                            perf_tokens / perf_dt,
+                            self.global_step,
+                        )
+                    perf_t_last = time.perf_counter()
+                    perf_tokens = 0
 
                 # 多优化器分组学习率
                 for opt_name, opt in zip(["Muon", "AdamW"], self.optimizers):
@@ -859,6 +911,7 @@ class PreTrainer:
                     )
 
                 if need_val:
+                    t_val0 = time.perf_counter()
                     # MoE 负载均衡统计（在 validate 前读取，避免被验证前向覆盖）
                     if self.moe_collector is not None:
                         moe_stats = self.moe_collector.stats()
@@ -935,6 +988,8 @@ class PreTrainer:
                         f"ent: {val_metrics['entropy']:.4f}"
                         + (" [ckpt]" if is_ckpt_step else "")
                     )
+                    # 验证/生成/checkpoint 的墙钟时间移出训练吞吐窗口（平移窗口起点即可）
+                    perf_t_last += time.perf_counter() - t_val0
 
                 # 进度显示
                 bar.update(1)

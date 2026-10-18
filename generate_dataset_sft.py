@@ -43,8 +43,14 @@ TOKENIZER_PATH = r"tokenizer/bbpe_tokenizer_7k_260723_xl.json"
 # }
 SFT_PATH_DICT = {
     r"train_text\SFT\synthetic_sft.txt": 1,
+    r"train_text\SFT\step_sft_chunk98_zh_sft.txt": 1,
+    r"train_text\SFT\step_sft_chunk97_zh_sft.txt": 1,
+    # r"train_text\ultrafineweb-l3-mutistyle-cn-part0.txt": 0.007,
+    #   ↑ 纯文本无 ChatML 结构，行级混入会被并入相邻对话样本、挤占 assistant
+    #     回答并触发左截断；预训练回放应在 batch 层与纯文本数据集混合。
+    # r"train_text\SFT\Infinity-Instruct-Gen-7MCore-00000-of-00015-processed.txt": 1,
 }
-OUTPUT_PATH = r"data/data_sft_synthetic768.txt"  # 输出文件（每行一个完整对话）
+OUTPUT_PATH = r"data/data_sft_synthetic_mix768.txt"  # 输出文件（每行一个完整对话）
 BATCH_SIZE = 2048  # 批量编码大小
 SEED = 42          # shuffle 随机种子
 SHUFFLE = True     # 全局打乱

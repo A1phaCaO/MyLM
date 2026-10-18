@@ -30,6 +30,7 @@
 用法：
     uv run python data_process/generate_synthetic_data.py --count 50 --parallel 8
     uv run python data_process/generate_synthetic_data.py --topics 历史,科学 --count 20 --temp 1.0
+    uv run python data_process/generate_synthetic_data.py --top-k 0 --top-p 1.0  # 纯温度采样
 """
 
 import argparse
@@ -53,13 +54,15 @@ LLAMA_BIN_DIR = r"D:\llama-b10472-bin-win-cuda-13.3-x64"
 LLAMA_SERVER_EXE = os.path.join(LLAMA_BIN_DIR, "llama-server.exe")
 
 # 模型路径（GGUF）
-MODEL_PATH = r"D:\Model\Qwen3.5-4B-UD-Q4_K_XL.gguf"
+# MODEL_PATH = r"D:\Model\Qwen3.5-4B-UD-Q4_K_XL.gguf"
+MODEL_PATH = r"D:\Model\MiniCPM5-2B-Q4_K_M.gguf"
+
 
 # 输出文件（ChatML 每行一条对话；jsonl 含元数据、用于去重和断点续跑）
 OUTPUT_TXT = os.path.join(os.path.dirname(
-    os.path.abspath(__file__)), "..", "train_text", "SFT", "synthetic_sft.txt")
+    os.path.abspath(__file__)), "..", "train_text", "SFT", "synthetic_sft_latest.txt")
 OUTPUT_JSONL = os.path.join(os.path.dirname(
-    os.path.abspath(__file__)), "..", "train_text", "SFT", "synthetic_sft.jsonl")
+    os.path.abspath(__file__)), "..", "train_text", "SFT", "synthetic_sft_latest.jsonl")
 # 旧版脚本曾把 jsonl 写在脚本目录；存在且与 --output-jsonl 不同时一并载入去重集合，
 # 避免跨运行去重断链
 LEGACY_JSONL = os.path.join(os.path.dirname(
@@ -70,11 +73,11 @@ SERVER_LOG = os.path.join(os.path.dirname(
 # llama-server 配置
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 18080
-PARALLEL = 16                # --parallel：回答消费者线程数。2026-10-06 完整扫描+
+PARALLEL = 24                # --parallel：回答消费者线程数。2026-10-06 完整扫描+
                              # 服务端探针实测（off+fa/poll）：聚合 tok/s
                              # np6=239 / np12=338 / np16=394，K 超订阅仅 +8%；
                              # 16 为吞吐最优，再高进入平台期（每步固定成本墙）
-PRODUCERS = 1                # --producers：出题生产者线程数（实测恒为 1 最优：
+PRODUCERS = 3                # --producers：出题生产者线程数（实测恒为 1 最优：
                              # 单题模式 P2N2s4≈19 条/分 vs P1N4s4≈43，多出的生产者
                              # 过度出题、在途请求偷走回答槽位算力，不要调大）
 SLOTS = 0                    # -np：服务端槽位数；0 = 自动（生产者 + 消费者）
@@ -83,30 +86,35 @@ CONTEXT = 0
 SERVER_READY_TIMEOUT = 120   # 等待服务就绪（秒）
 
 # 生成参数
-NUM_SAMPLES = 1000           # 本次要生成的新样本数（去重后净增）
+NUM_SAMPLES = 6000           # 本次要生成的新样本数（去重后净增）
 MAX_N_TOKENS = 768           # 单次生成最大 token 数（--max-tokens 可覆盖）
 GPU_LAYERS = 99              # 送入 GPU 的层数（-ngl）
 SPEC_DRAFT_N_MAX = 0         # MTP 投机深度；0=关闭。实测高并行下投机净亏：
                              # 探针 np12 贪心 mtp2=308.6 vs off=337.9 tok/s(×0.91)，
                              # 流水线 t768 off 比 mtp2 条/分 +19%（低 N≤2 才占优）
-TEMPERATURE = 0.7            # 采样温度（--temp 可覆盖）
+TEMPERATURE = 1            # 采样温度（--temp 可覆盖）
+TOP_K = 20                   # top-k 采样：每步只保留概率最高的 k 个 token
+                             # （--top-k；0 = 关闭，退化为纯温度采样）
+TOP_P = 0.95                 # top-p（核采样）阈值（--top-p；1.0 = 关闭）
+                             # 默认 40 / 0.95 与 llama-server 自带默认值一致，
+                             # 即不额外改变既有采样行为，只是显式化
 SEED = -1                    # 随机种子（-1 = 每次随机）
 MAX_RETRIES = 3              # 单条样本失败重试次数
 REQUEST_TIMEOUT = 300        # 单次 HTTP 请求超时（秒）
-QUESTIONS_PER_BATCH = 16     # 一个对话批量生成的问题数（=1 时自动取消批量机制）
+QUESTIONS_PER_BATCH = 8     # 一个对话批量生成的问题数（=1 时自动取消批量机制）
 MAX_EMPTY_ROUNDS = 8         # 生产者连续这么多轮零产新题则判服务异常并终止
 
 # 问题生成的主题池（--topics 可覆盖）
 TOPICS = [
-    "中国历史", "日常生活", "日常对话", "科学常识", "常识问答", "编程技术", "文学创作",
-    "心理健康", "学习方法", "数学", "科技数码", "自我介绍与身份问答",
-    "美食", "旅行", "职业规划", "传统文化", "人工智能",
+    "人文历史", "事件点评", "通识问答", "科普问答", "经济与社会发展", "科学常识", "常识问答", "编程技术", "文学创作",
+    "心理健康", "学习方法", "生活技巧", "数学", "科技数码", "艺术与文体", #"询问对方身份",
+    "美食", "旅行", "职业规划", "传统文化", "人工智能", "工程技术"
 ]
 
 # 系统提示词
 SYSTEM_QUESTION_PROMPT = (
-    "你是一个中文数据生成助手。请基于给定的主题，生成一批互不相同、**答案简单**、"
-    "有讨论价值的问题。每行一个问题，用\"1.\" \"2.\"等数字编号开头。"
+    "你是一个中文数据生成助手。请基于给定的主题，生成一批互不相同、**答案简单、"
+    "内容多样**、有讨论价值的问题。每行一个问题，用\"1.\" \"2.\"等数字编号开头。"
     "只输出编号问题列表，不要任何解释、前缀或后缀。"
 )
 # 单题模式（QUESTIONS_PER_BATCH=1）专用：一次对话只出一题
@@ -117,7 +125,7 @@ SYSTEM_SINGLE_QUESTION_PROMPT = (
 )
 SYSTEM_ANSWER_PROMPT = (
     "你是一个乐于助人的中文AI助手。请认真回答用户的问题，"
-    "给出简要的回答，不超过400字。"
+    "给出简要的回答，不超过500字。"
 )
 
 # 问题质量黑名单（命中即重试）：模型常见"解释自己设计"的废话
@@ -263,15 +271,17 @@ class LlamaServer:
         return False
 
     def chat(self, messages: list, seed: int, max_tokens: int,
-             temperature: float) -> str:
+             temperature: float, top_k: int, top_p: float) -> str:
         """OpenAI 兼容接口 /v1/chat/completions，返回 assistant 文本。
 
-        max_tokens / temperature 由调用方显式传入（来自 CLI 参数），
-        不要在这里引用模块常量，否则 --max-tokens/--temp 会变成死参数。"""
+        max_tokens / temperature / top_k / top_p 由调用方显式传入（来自 CLI 参数），
+        不要在这里引用模块常量，否则 --max-tokens/--temp 等会变成死参数。"""
         body = json.dumps({
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
             "seed": seed,
             "stream": False,
         }).encode("utf-8")
@@ -300,7 +310,8 @@ class LlamaServer:
 
 def generate_question_batch(server: LlamaServer, topic: str, seed: int,
                             n_questions: int, temperature: float,
-                            max_tokens: int) -> list[str]:
+                            max_tokens: int, top_k: int,
+                            top_p: float) -> list[str]:
     """步骤 1：一个对话批量生成 n_questions 个问题（重试，全部失败返回 []）。"""
     messages = [
         {"role": "system", "content": SYSTEM_QUESTION_PROMPT},
@@ -310,7 +321,7 @@ def generate_question_batch(server: LlamaServer, topic: str, seed: int,
     for attempt in range(MAX_RETRIES):
         try:
             raw = sanitize(server.chat(messages, seed + attempt, max_tokens,
-                                       temperature))
+                                       temperature, top_k, top_p))
             qs = [q for q in parse_question_batch(raw) if validate_question(q)]
         except Exception as e:
             print(f"  [warn] 问题批量生成失败({e})，重试 {attempt + 1}/{MAX_RETRIES}")
@@ -352,7 +363,8 @@ def parse_single_question(text: str) -> str:
 
 
 def generate_single_question(server: LlamaServer, topic: str, seed: int,
-                             temperature: float, max_tokens: int) -> str | None:
+                             temperature: float, max_tokens: int,
+                             top_k: int, top_p: float) -> str | None:
     """步骤 1（单题模式，QUESTIONS_PER_BATCH=1）：一次对话只生成一个问题。
 
     不经过编号列表解析，直接校验；重试全部失败返回 None。"""
@@ -363,7 +375,7 @@ def generate_single_question(server: LlamaServer, topic: str, seed: int,
     for attempt in range(MAX_RETRIES):
         try:
             raw = sanitize(server.chat(messages, seed + attempt, max_tokens,
-                                       temperature))
+                                       temperature, top_k, top_p))
             q = parse_single_question(raw)
         except Exception as e:
             print(f"  [warn] 单题生成失败({e})，重试 {attempt + 1}/{MAX_RETRIES}")
@@ -375,7 +387,8 @@ def generate_single_question(server: LlamaServer, topic: str, seed: int,
 
 
 def generate_answer(server: LlamaServer, question: str, seed: int,
-                    temperature: float, max_tokens: int) -> str | None:
+                    temperature: float, max_tokens: int,
+                    top_k: int, top_p: float) -> str | None:
     """步骤 3：把问题送入全新对话生成回答（内部重试，全部失败返回 None）。"""
     messages = [
         {"role": "system", "content": SYSTEM_ANSWER_PROMPT},
@@ -384,7 +397,7 @@ def generate_answer(server: LlamaServer, question: str, seed: int,
     for attempt in range(MAX_RETRIES):
         try:
             a = sanitize(server.chat(messages, seed + attempt + 1000,
-                                     max_tokens, temperature))
+                                     max_tokens, temperature, top_k, top_p))
         except Exception as e:
             print(f"  [warn] 回答生成失败({e})，重试 {attempt + 1}/{MAX_RETRIES}")
             continue
@@ -414,12 +427,14 @@ def produce_questions(server: LlamaServer, args, topics: list, seen: set,
         seed = rng.randint(0, 2**31 - 1)
         if args.questions_per_batch <= 1:
             q = generate_single_question(server, topic, seed,
-                                         args.temp, args.max_tokens)
+                                         args.temp, args.max_tokens,
+                                         args.top_k, args.top_p)
             qs = [q] if q else []
         else:
             qs = generate_question_batch(server, topic, seed,
                                          args.questions_per_batch,
-                                         args.temp, args.max_tokens)
+                                         args.temp, args.max_tokens,
+                                         args.top_k, args.top_p)
         new_items = []
         with seen_lock:
             for q in qs:
@@ -441,10 +456,10 @@ def produce_questions(server: LlamaServer, args, topics: list, seen: set,
         for item in new_items:
             while not stop_event.is_set():
                 try:
-                    q_buf.put(item, timeout=0.5)
+                    q_buf.put(item, timeout=0.3)
                     break
                 except queue.Full:
-                    pass  # 缓冲满，等消费者腾出空间（每 0.5s 重查停止信号）
+                    pass  # 缓冲满，等消费者腾出空间（每 0.3s 重查停止信号）
 
 
 def answer_worker(server: LlamaServer, args, worker_id: int, q_buf: queue.Queue,
@@ -463,7 +478,8 @@ def answer_worker(server: LlamaServer, args, worker_id: int, q_buf: queue.Queue,
         if stop_event.is_set():
             return
         a = generate_answer(server, q, rng.randint(0, 2**31 - 1),
-                            args.temp, args.max_tokens)
+                            args.temp, args.max_tokens,
+                            args.top_k, args.top_p)
         results.put((q, qn, topic, a))
 
 
@@ -481,6 +497,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-jsonl", type=str, default=OUTPUT_JSONL)
     parser.add_argument("--gpu-layers", type=int, default=GPU_LAYERS)
     parser.add_argument("--temp", type=float, default=TEMPERATURE)
+    parser.add_argument("--top-k", type=int, default=TOP_K,
+                        help="top-k 采样：每步只保留概率最高的 k 个 token；0 = 关闭")
+    parser.add_argument("--top-p", type=float, default=TOP_P,
+                        help="top-p 核采样阈值；1.0 = 关闭")
     parser.add_argument("--max-tokens", type=int, default=MAX_N_TOKENS)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--parallel", type=int,
@@ -516,9 +536,13 @@ def main() -> None:
         # 批量模式默认一整批；单题模式给 2 倍线程总数深度，避免生产者过度节流
         args.buffer = ((args.producers + args.parallel) * 2
                        if args.questions_per_batch <= 1
-                       else args.questions_per_batch)
+                       else args.questions_per_batch * args.producers)
     if args.buffer < 1:
         sys.exit("--buffer 至少为 1")
+    if args.top_k < 0:
+        sys.exit("--top-k 不能为负（0 = 关闭）")
+    if not 0.0 < args.top_p <= 1.0:
+        sys.exit("--top-p 需在 (0.0, 1.0] 区间内（1.0 = 关闭）")
 
     if not os.path.exists(LLAMA_SERVER_EXE):
         sys.exit(f"找不到 llama-server: {LLAMA_SERVER_EXE}")
@@ -561,6 +585,8 @@ def main() -> None:
     print(f"[info] 流水线: {args.producers} 出题线程 + {args.parallel} 回答线程 + 主线程写盘，"
           f"缓冲 {args.buffer} 题（槽位 {slots}，总上下文 {ctx}）")
     print(f"[info] 每对话批量问题数: {args.questions_per_batch}")
+    print(f"[info] 采样: temp={args.temp} top_k={args.top_k} top_p={args.top_p} "
+          f"max_tokens={args.max_tokens}")
     print(f"[info] 历史样本: {len(seen)} 条（用于去重，含旧产物）")
 
     producers = [
@@ -620,7 +646,8 @@ def main() -> None:
                 eta = (args.count - made) * elapsed / made
                 print(
                     f"[{made}/{args.count}] 近期 {rate_recent:.0f} 条/分 | 均速 {rate:.1f} 条/分 | ETA {eta:.0f}s | "
-                    f"Q: {q[:10]}...A: {a[:40]}...")
+                    f"缓冲 {q_buf.qsize()}/{args.buffer} | 主题: {topic} |\n"
+                    f"Q: {q[:15]}...A: {a[:35]}...")
             stop_event.set()
     except KeyboardInterrupt:
         stop_event.set()

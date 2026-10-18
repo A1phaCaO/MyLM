@@ -28,7 +28,8 @@ uv run python train_tokenizer.py      # 训练 BBPE tokenizer → tokenizer/
 - `data/` 生成后数据集、`tokenizer/` 被引用的分词器 json（均从仓库根按相对路径引用）、`model/` 权重+推理配置 json、`ckpt/` 训练 checkpoint、`logs/` TensorBoard。这些全在 gitignore（`data/`、`train_text/`、`*.txt`、`*.npy`、`*.log` 等），fresh clone 后需重新生成数据。
 - `tools/checks/`（验证/复现脚本）与 `tools/model_tools/`（推理检查工具）：**从仓库根运行**；引用根模块的脚本靠顶部 `sys.path.insert(0, parents[2])` 引导，移动脚本需保持该深度约定。
 - `debug_moe.py` 不可移动：内部子进程 `python -c "from debug_moe import ..."` 依赖 cwd=仓库根。
-- 归档区（复现旧 run 才碰）：`legacy/`（scripts: continue_training.py+models_250830.py、generate_dataset_v2.py、hyperparameter_search.py——后者 import 已不存在的 `StreamingTextDataset`，本就 broken；models: models_2507*.py）、`legacy_model_configuration/`（含 legacy `config.json`，**任何脚本都不读它，其中 vocab_size/scaling 字段已过期**）、`tokenizer_archive/`、`notebooks/`、`autoresearch/`、`experiments/`。
+- 归档区（复现旧 run 才碰）：`legacy/`（scripts: continue_training.py+models_250830.py、generate_dataset_v2.py、hyperparameter_search.py——后者 import 已不存在的 `StreamingTextDataset`，本就 broken；models: models_2507*.py）、`legacy_model_configuration/`（含 legacy `config.json`，**任何脚本都不读它，其中 vocab_size/scaling 字段已过期**）、`tokenizer_archive/`、`notebooks/`、`autoresearch/`。
+- **`experiments/` = 测试/实验脚本唯一去处（261018 定）**：今后所有验证、探针、benchmark、对照实验类脚本一律新建在 `experiments/` 下，**禁止在仓库根目录创建**（历史上根的 `bench_*_tmp.py` 临时脚本已清理）。产物写 `experiments/results/<name>_<时间戳>/` 或同名 csv/md。引用根模块的约定：顶部 `ROOT = Path(__file__).resolve().parent.parent; sys.path.insert(0, str(ROOT))`（参照 `experiments/common.py`、`experiments/val_stall_profile.py`），从仓库根运行：`uv run python experiments/<name>.py`。一次性微探针可命名 `*_tmp.py`（同目录，任务结束默认删除）；有留存价值的实验脚本应提交进版本库。
 
 ## 训练管线（`pre_train.py`）
 
@@ -62,4 +63,4 @@ uv run python train_tokenizer.py      # 训练 BBPE tokenizer → tokenizer/
 - TensorBoard 看 `logs/`：`launch_tensorboard.bat`。架构测试实验在 `logs/exp/<name>_<时间戳>/`（`arch_test.py` 产出，可多 run 并排：`tensorboard --logdir logs/exp`）。
 - **新架构验证用 `arch_test.py`**（pre_train.py 精简版：双优化器/WSD/梯度累积/确定性续训同口径，砍掉 MoE 热力图/权重统计/文本生成/ckpt pruning）；换模型只改顶部 `build_model`+`MODEL_ARGS`，契约 `forward(ids, padding_mask=...) -> (B,S,V)`；调试可传 override JSON 路径缩短 run（max_steps/val_interval_step）。
 - `tools/checks/bench_module.py`：任意 nn.Module 的 FP/BP/STEP 吞吐+显存 benchmark（纯常量配置，无 CLI 参数；`uv run python tools/checks/bench_module.py`）。
-- 实验产物在 `experiments/results/`（初始化 sweep、sdpa bench 等）；一次性临时脚本约定命名 `bench_*_tmp.py`（已 gitignore）。
+- 实验产物在 `experiments/results/`（初始化 sweep、sdpa bench 等）。测试/实验脚本一律放 `experiments/`，不再在仓库根创建一次性 `bench_*_tmp.py`（.gitignore 中的该条目仅作误放根目录的兜底）。

@@ -32,47 +32,47 @@ class TrainingConfig:
     # 数据配置
     # SFT 数据：每行 = 一段 ChatML 对话（未预分词），格式示例：
     #   "<|im_start|>user\n问题内容<|im_end|>\n<|im_start|>assistant\n回答内容<|im_end|>\n"
-    data_dir: str = r"data/data_sft512v3.txt"
+    data_dir: str = r"data\data_sft_synthetic_mix768.txt"
     tokenizer_dir: str = r"tokenizer/bbpe_tokenizer_7k_260723_xl.json"
-    model_save_dir: str = r"model\model_sft_ca8conv4.pth"
+    model_save_dir: str = r"model\model_sft_ca8conv4_synthetic_mix_nano.pth"
     ckpt_save_dir: str = r"ckpt\sft_ckpt.pth"
-    config_save_dir: str = r"model\config_sft_ca8conv4.json"
-    log_dir: str = r"logs/sft/" +"sft_ca8conv4_"+ time.strftime("%y%m%d-%H%M")
+    config_save_dir: str = r"model\config_sft_ca8conv4_synthetic_mix_nano.json"
+    log_dir: str = r"logs/sft/" +"sft_ca8conv4_synthetic_mix_nano_"+ time.strftime("%y%m%d-%H%M")
     padding_side: str = "right"   # 右 pad：左截断保留回答尾部 + pad 加在尾部，
     #                                 causal mask 天然隔离 pad，不再依赖 seq_mask 零假设
 
     # 训练参数
     seed: int = 42
     epochs: int = 2
-    batch_size: int = 32
-    batch_acceleration: int = 1
-    dataset_downsample: float = 1.0   # (0,1)=降采样, 1=全量, >1=重复（SFTTextDataset 语义）
+    batch_size: int = 16
+    batch_acceleration: int = 2
+    dataset_downsample: float = 1   # (0,1)=降采样, 1=全量, >1=重复（SFTTextDataset 语义）
     valset_rate: float = 0.01
-    val_interval_step: int = 500
-    seq_max_len: int = 512   # 结构对齐终版 pretrain（256），SFT 扩到 512
+    val_interval_step: int = 300
+    seq_max_len: int = 768   # 结构对齐终版 pretrain（256），SFT 扩到 512
     #                            （加载时过滤 RoPE buffer 形状失配）
     use_compile: bool = True
-    compile_mode: str = "max-autotune"
+    compile_mode: str = "default"
     # compile 时是否将 MoE 层排除在外（已过时，保持默认 False）
     exclude_moe_from_compile: bool = False
 
     # 优化参数（SFT 微调远小于 pretrain 的 4e-3）
-    learning_rate: float = 1e-4
-    min_learning_rate: float = 1e-5   # WSD 衰减到峰值 LR 的 50%（若需按项目约定衰减到 10% 改为 1e-5）
+    learning_rate: float = 2e-4
+    min_learning_rate: float = 2e-5   # WSD 衰减到峰值 LR 的 50%（若需按项目约定衰减到 10% 改为 1e-5）
     lr_decay_start_rate: int = 0.8    # 最后 20% 步数线性衰减
-    warmup_steps: int = 2
+    warmup_steps: int = 4
     use_amp: bool = True
 
     model_args = MyLMArgs(
         # 架构与 pre_train.py 终版 model_args 完全一致（dense + ca8/conv4），
         # 仅 seq_max_len 与 dropout 按 SFT 口径调整
-        d_model=384,
+        d_model=512,
         latent_moe=False,
         d_latent=256,
-        d_inner=int(((384 * (8 / 3)) // 64) * 64),  # =1024
+        d_inner=int(((512 * (8 / 3)) // 64) * 64),  # =1024
         d_head=128,
         n_heads=None,
-        n_layers=6,
+        n_layers=8,
         vocab_size=None,
         seq_max_len=seq_max_len,
         use_moe=False,
@@ -97,7 +97,7 @@ class TrainingConfig:
     dataset_shuffle_seed: Optional[int] = 42
 
     # SFT 特有：从 pretrain 权重开始微调（纯权重文件或完整 checkpoint 均可）
-    train_from: Optional[str] = r"model\model_dense_ca8conv4_261004.pth"
+    train_from: Optional[str] = r"model\model_dense_ca8conv4_261007.pth"
 
 
 class SFTTrainer(PreTrainer):
@@ -143,16 +143,30 @@ class SFTTrainer(PreTrainer):
             pin_memory=True,
             num_workers=4,
             prefetch_factor=4,
-            persistent_workers=True
+            # persistent_workers=False（与父类 PreTrainer 同口径，261018 修正）：
+            # 继承的 train() 每 epoch 开头调 base.set_permute_seed(seed+epoch) 换排列，
+            # 而 True 时 worker 会一直持有首次 spawn 时 pickle 的旧 perm 副本（主进程
+            # 的 set_permute_seed 改不到 worker）→ epochs>=2 时第 2 个 epoch 会用与
+            # 第 1 个 epoch 完全相同的数据顺序。False 时每 epoch 重 spawn，新排列传入
+            # worker（M4）。仅在 epoch 边界付一次 spawn 代价，与 val 每次触发不同，
+            # 不是热路径。
+            persistent_workers=False
         )
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
             batch_size=self.config.batch_size,
-            shuffle=True,
+            # 固定顺序遍历（与父类 pre_train 同步）：shuffle=True + drop_last
+            # 会让每次 val 随机丢弃的尾部 partial batch 集合漂移，相邻两次
+            # val_loss 不严格可比。persistent_workers=True 已使 worker 池只首次
+            # spawn，固定后每次 val 恰好遍历同一组 batch。
+            shuffle=False,
             drop_last=True,
             pin_memory=False,
             num_workers=2,
             prefetch_factor=3,
+            # val 数据集/顺序全程不变 -> worker 池复用，避免每次 validate 重 spawn
+            # （Windows spawn 下每 worker 重新 import 主模块+torch，数十秒 GPU 空转，
+            # 表现为「一到 val 就卡住」）。
             persistent_workers=True
         )
 
